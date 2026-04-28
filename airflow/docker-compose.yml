@@ -1,0 +1,47 @@
+services:
+  airflow:
+    image: apache/airflow:2.10.4-python3.12
+    container_name: fraud_airflow
+    command: standalone
+    environment:
+      # Airflow core config
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__LOGGING__BASE_LOG_FOLDER=/opt/airflow/logs
+      # Airflow metadata DB (host PostgreSQL)
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://postgres:desmond316@host.docker.internal:5432/airflow_metadata
+      # Auto-create admin on first run
+      - _AIRFLOW_DB_MIGRATE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+      # Install extra Python packages the DAG needs
+      - _PIP_ADDITIONAL_REQUIREMENTS=scikit-learn==1.5.1 joblib psycopg2-binary python-dotenv
+      # Fraud DB credentials — read by the DAG via os.getenv()
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - DB_NAME=fraud_detection
+      - DB_USER=postgres
+      - DB_PASSWORD=desmond316
+    volumes:
+      # DAG file
+      - ./dags:/opt/airflow/dags
+      # Logs visible on host for debugging
+      - ./logs:/opt/airflow/logs
+      # Detection package — mounted at /opt/src so _PROJECT_ROOT=/opt resolves correctly
+      # (_PROJECT_ROOT = 2 levels up from /opt/airflow/dags = /opt)
+      - ../src:/opt/src
+      # Trained model
+      - ../models:/opt/models
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
