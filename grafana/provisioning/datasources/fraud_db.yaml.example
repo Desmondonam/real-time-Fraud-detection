@@ -1,0 +1,20 @@
+apiVersion: 1
+
+datasources:
+  - name: FraudDB
+    type: postgres
+    uid: fraud_postgres
+    url: host.docker.internal:5432
+    database: fraud_detection
+    user: <db_user>
+    secureJsonData:
+      password: <db_password>
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      postgresVersion: 1700
+      timescaledb: false
+    isDefault: true
+    editable: false

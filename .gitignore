@@ -1,6 +1,7 @@
 .env
 airflow/airflow.env
 models/*.pkl
+grafana/provisioning/datasources/fraud_db.yaml
 airflow/airflow.cfg
 airflow/logs/
 airflow/plugins/

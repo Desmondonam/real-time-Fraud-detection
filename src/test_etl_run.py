@@ -39,7 +39,7 @@ def engine():
 
 def reset_fraud_alerts(eng):
     with eng.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS fraud_alerts"))
+        conn.execute(text("DROP TABLE IF EXISTS fraud_alerts CASCADE"))
         conn.execute(text("""
             CREATE TABLE fraud_alerts (
                 id                 SERIAL PRIMARY KEY,
