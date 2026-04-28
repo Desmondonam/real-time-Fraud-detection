@@ -1,5 +1,6 @@
 .env
 airflow/airflow.env
+models/*.pkl
 airflow/airflow.cfg
 airflow/logs/
 airflow/plugins/

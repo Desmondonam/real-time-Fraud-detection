@@ -10,7 +10,7 @@ the 48-hour dataset cycles indefinitely.
 Pipeline per run
 ----------------
 1. ensure_fraud_alerts_table  — idempotent DDL
-2. fetch_and_score_batch      — reads window, computes risk score
+2. fetch_and_score_batch      — reads window, scores with CombinedScorer
 3. write_alerts               — inserts high-risk rows into fraud_alerts
 4. log_summary                — prints batch stats to Airflow logs
 """
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -26,29 +27,23 @@ from airflow.decorators import dag, task
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-load_dotenv(
-    dotenv_path=os.path.join(
-        os.path.dirname(__file__), "..", "..", ".env"
-    )
-)
+# Make the src package importable from the DAG
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+load_dotenv(dotenv_path=os.path.join(_PROJECT_ROOT, ".env"))
 
 log = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-DATASET_DURATION_SECS = 172_800   # ~48 h — full span of the creditcard dataset
-BATCH_SIZE_SECS = 3_600           # 1 hour per batch
+DATASET_DURATION_SECS = 172_800
+BATCH_SIZE_SECS = 3_600
 DAG_START_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
-# Risk thresholds derived from known high-signal PCA components in this dataset
-RISK_RULES = {
-    "V14": (-5.0, 2.0),   # (low_threshold, high_threshold) — extreme values flag risk
-    "V17": (-5.0, 2.0),
-    "V12": (-4.0, 2.5),
-    "V10": (-4.0, 2.0),
-}
-RISK_SCORE_THRESHOLD = 2.0        # flag if risk_score >= this OR Class == 1
-
+_ALL_FEATURES = [f"V{i}" for i in range(1, 29)]
+_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "isolation_forest.pkl")
 
 # ── DB connection ─────────────────────────────────────────────────────────────
 
@@ -64,31 +59,11 @@ def _engine():
     return create_engine(url)
 
 
-# ── risk scoring ──────────────────────────────────────────────────────────────
-
-def _compute_risk_score(df: pd.DataFrame) -> pd.Series:
-    """
-    Returns a float risk score per row.
-    Each PCA feature that crosses its threshold contributes +1.
-    Normalized Amount > 2 adds +0.5.
-    """
-    score = pd.Series(0.0, index=df.index)
-
-    for col, (lo, hi) in RISK_RULES.items():
-        if col in df.columns:
-            score += ((df[col] < lo) | (df[col] > hi)).astype(float)
-
-    if "Amount" in df.columns:
-        score += (df["Amount"].abs() > 2.0).astype(float) * 0.5
-
-    return score
-
-
 # ── DAG ───────────────────────────────────────────────────────────────────────
 
 @dag(
     dag_id="fraud_etl_pipeline",
-    description="Hourly batch ETL — flags high-risk transactions into fraud_alerts",
+    description="Hourly batch ETL — scores transactions with IF + rule engine, writes alerts",
     schedule="@hourly",
     start_date=DAG_START_DATE,
     catchup=False,
@@ -107,69 +82,55 @@ def fraud_etl_pipeline():
         with engine.begin() as conn:
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS fraud_alerts (
-                    id               SERIAL PRIMARY KEY,
-                    batch_start_sec  DOUBLE PRECISION NOT NULL,
-                    batch_end_sec    DOUBLE PRECISION NOT NULL,
-                    "Time"           DOUBLE PRECISION,
-                    "Amount"         DOUBLE PRECISION,
-                    "V14"            DOUBLE PRECISION,
-                    "V17"            DOUBLE PRECISION,
-                    "V12"            DOUBLE PRECISION,
-                    "V10"            DOUBLE PRECISION,
-                    risk_score       DOUBLE PRECISION,
+                    id                 SERIAL PRIMARY KEY,
+                    batch_start_sec    DOUBLE PRECISION NOT NULL,
+                    batch_end_sec      DOUBLE PRECISION NOT NULL,
+                    "Time"             DOUBLE PRECISION,
+                    "Amount"           DOUBLE PRECISION,
+                    rule_score         DOUBLE PRECISION,
+                    if_score           DOUBLE PRECISION,
+                    combined_score     DOUBLE PRECISION,
                     is_confirmed_fraud BOOLEAN,
-                    flagged_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    flagged_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                 )
             """))
         log.info("fraud_alerts table is ready")
 
     @task()
     def fetch_and_score_batch(logical_date: str) -> dict:
-        """
-        Determine the dataset window for this run, load it from transactions,
-        apply risk scoring, and return the high-risk rows as a JSON payload.
-        """
+        from src.detection.scorer import CombinedScorer
+
         run_dt = datetime.fromisoformat(logical_date)
         hours_since_start = int(
             (run_dt - DAG_START_DATE).total_seconds() // BATCH_SIZE_SECS
         )
-        # Wrap around the dataset so the DAG can run indefinitely
         window_idx = hours_since_start % (DATASET_DURATION_SECS // BATCH_SIZE_SECS)
-        batch_start = window_idx * BATCH_SIZE_SECS
+        batch_start = float(window_idx * BATCH_SIZE_SECS)
         batch_end = batch_start + BATCH_SIZE_SECS
 
-        log.info(
-            "Run hour %d → dataset window [%d, %d) seconds",
-            hours_since_start, batch_start, batch_end,
-        )
+        log.info("Run hour %d => dataset window [%.0f, %.0f) s",
+                 hours_since_start, batch_start, batch_end)
 
-        engine = _engine()
-        query = text("""
-            SELECT "Time", "Amount", "V10", "V12", "V14", "V17", "Class"
+        # Load all features needed by the scorer
+        feature_cols = ", ".join(f'"{c}"' for c in _ALL_FEATURES)
+        query = text(f"""
+            SELECT "Time", {feature_cols}, "Amount", "Class"
             FROM   transactions
             WHERE  "Time" >= :start AND "Time" < :end
         """)
+        engine = _engine()
         df = pd.read_sql(query, engine, params={"start": batch_start, "end": batch_end})
-
         log.info("Batch contains %d transactions", len(df))
 
         if df.empty:
-            return {
-                "batch_start": batch_start,
-                "batch_end": batch_end,
-                "alerts": [],
-                "total": 0,
-                "flagged": 0,
-            }
+            return {"batch_start": batch_start, "batch_end": batch_end,
+                    "total": 0, "flagged": 0, "alerts": []}
 
-        df["risk_score"] = _compute_risk_score(df)
-        high_risk = df[
-            (df["risk_score"] >= RISK_SCORE_THRESHOLD) | (df["Class"] == 1)
-        ].copy()
+        scorer = CombinedScorer.load(model_path=_MODEL_PATH)
+        df = scorer.score(df)
 
-        log.info(
-            "Flagged %d / %d transactions as high-risk", len(high_risk), len(df)
-        )
+        high_risk = df[df["is_high_risk"] | (df["Class"] == 1)].copy()
+        log.info("Flagged %d / %d as high-risk", len(high_risk), len(df))
 
         high_risk["batch_start_sec"] = batch_start
         high_risk["batch_end_sec"] = batch_end
@@ -185,7 +146,7 @@ def fraud_etl_pipeline():
     @task()
     def write_alerts(batch_result: dict) -> int:
         if not batch_result["alerts"]:
-            log.info("No alerts to write for this batch")
+            log.info("No alerts for this batch")
             return 0
 
         alerts_df = pd.DataFrame(batch_result["alerts"])
@@ -194,18 +155,16 @@ def fraud_etl_pipeline():
 
         cols = [
             "batch_start_sec", "batch_end_sec",
-            "Time", "Amount", "V14", "V17", "V12", "V10",
-            "risk_score", "is_confirmed_fraud",
+            "Time", "Amount",
+            "rule_score", "if_score", "combined_score",
+            "is_confirmed_fraud",
         ]
         alerts_df = alerts_df[[c for c in cols if c in alerts_df.columns]]
 
         engine = _engine()
         alerts_df.to_sql(
-            "fraud_alerts",
-            engine,
-            if_exists="append",
-            index=False,
-            method="multi",
+            "fraud_alerts", engine,
+            if_exists="append", index=False, method="multi",
         )
         log.info("Wrote %d alert rows to fraud_alerts", len(alerts_df))
         return len(alerts_df)
@@ -214,15 +173,12 @@ def fraud_etl_pipeline():
     def log_summary(batch_result: dict, alerts_written: int):
         log.info(
             "=== Batch Summary ===\n"
-            "  Window   : [%.0f, %.0f) seconds\n"
-            "  Total tx : %d\n"
-            "  Flagged  : %d\n"
-            "  Inserted : %d alerts",
-            batch_result["batch_start"],
-            batch_result["batch_end"],
-            batch_result["total"],
-            batch_result["flagged"],
-            alerts_written,
+            "  Window      : [%.0f, %.0f) seconds\n"
+            "  Total tx    : %d\n"
+            "  Flagged     : %d\n"
+            "  Inserted    : %d alerts",
+            batch_result["batch_start"], batch_result["batch_end"],
+            batch_result["total"], batch_result["flagged"], alerts_written,
         )
 
     # ── wire tasks ────────────────────────────────────────────────────────────

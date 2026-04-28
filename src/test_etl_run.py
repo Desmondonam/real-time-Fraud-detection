@@ -1,6 +1,10 @@
 """
-Standalone test: runs the ETL pipeline logic for one batch without Airflow.
-Simulates the first DAG run (window 0–3600 seconds).
+Standalone test: runs the ETL pipeline logic for three consecutive 1-hour
+batches using the CombinedScorer (Isolation Forest + rule engine).
+Does not require Airflow to be running.
+
+Run:
+    python src/test_etl_run.py
 """
 
 import logging
@@ -12,17 +16,15 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from src.detection.scorer import CombinedScorer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-RISK_RULES = {
-    "V14": (-5.0, 2.0),
-    "V17": (-5.0, 2.0),
-    "V12": (-4.0, 2.5),
-    "V10": (-4.0, 2.0),
-}
-RISK_SCORE_THRESHOLD = 2.0
+_ALL_FEATURES = [f"V{i}" for i in range(1, 29)]
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "isolation_forest.pkl")
 
 
 def engine():
@@ -35,42 +37,32 @@ def engine():
     return create_engine(url)
 
 
-def ensure_fraud_alerts_table(eng):
+def reset_fraud_alerts(eng):
     with eng.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS fraud_alerts"))
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS fraud_alerts (
+            CREATE TABLE fraud_alerts (
                 id                 SERIAL PRIMARY KEY,
                 batch_start_sec    DOUBLE PRECISION NOT NULL,
                 batch_end_sec      DOUBLE PRECISION NOT NULL,
                 "Time"             DOUBLE PRECISION,
                 "Amount"           DOUBLE PRECISION,
-                "V14"              DOUBLE PRECISION,
-                "V17"              DOUBLE PRECISION,
-                "V12"              DOUBLE PRECISION,
-                "V10"              DOUBLE PRECISION,
-                risk_score         DOUBLE PRECISION,
+                rule_score         DOUBLE PRECISION,
+                if_score           DOUBLE PRECISION,
+                combined_score     DOUBLE PRECISION,
                 is_confirmed_fraud BOOLEAN,
                 flagged_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """))
-    log.info("fraud_alerts table ready")
+    log.info("fraud_alerts table (re)created with new schema")
 
 
-def compute_risk_score(df: pd.DataFrame) -> pd.Series:
-    score = pd.Series(0.0, index=df.index)
-    for col, (lo, hi) in RISK_RULES.items():
-        if col in df.columns:
-            score += ((df[col] < lo) | (df[col] > hi)).astype(float)
-    if "Amount" in df.columns:
-        score += (df["Amount"].abs() > 2.0).astype(float) * 0.5
-    return score
-
-
-def run_batch(eng, batch_start: float, batch_end: float):
+def run_batch(eng, scorer: CombinedScorer, batch_start: float, batch_end: float):
     log.info("Processing window [%.0f, %.0f) seconds", batch_start, batch_end)
 
-    query = text("""
-        SELECT "Time", "Amount", "V10", "V12", "V14", "V17", "Class"
+    feature_cols = ", ".join(f'"{c}"' for c in _ALL_FEATURES)
+    query = text(f"""
+        SELECT "Time", {feature_cols}, "Amount", "Class"
         FROM   transactions
         WHERE  "Time" >= :start AND "Time" < :end
     """)
@@ -78,31 +70,29 @@ def run_batch(eng, batch_start: float, batch_end: float):
     log.info("Batch rows: %d", len(df))
 
     if df.empty:
-        log.info("Empty batch — nothing to flag")
         return
 
-    df["risk_score"] = compute_risk_score(df)
-    high_risk = df[(df["risk_score"] >= RISK_SCORE_THRESHOLD) | (df["Class"] == 1)].copy()
-    log.info("High-risk rows: %d / %d", len(high_risk), len(df))
+    df = scorer.score(df)
+    high_risk = df[df["is_high_risk"] | (df["Class"] == 1)].copy()
+    log.info("High-risk: %d (rule_score>0: %d, if_score>0.4: %d, confirmed fraud: %d)",
+             len(high_risk),
+             (high_risk["rule_score"] > 0).sum(),
+             (high_risk["if_score"] > 0.4).sum(),
+             (high_risk["Class"] == 1).sum())
 
     if high_risk.empty:
-        log.info("No alerts for this window")
         return
 
     high_risk["batch_start_sec"] = batch_start
     high_risk["batch_end_sec"] = batch_end
-    high_risk = high_risk.rename(columns={"Class": "is_confirmed_fraud"})
-    high_risk["is_confirmed_fraud"] = high_risk["is_confirmed_fraud"].astype(bool)
+    out = high_risk.rename(columns={"Class": "is_confirmed_fraud"})
+    out["is_confirmed_fraud"] = out["is_confirmed_fraud"].astype(bool)
 
-    cols = [
-        "batch_start_sec", "batch_end_sec",
-        "Time", "Amount", "V14", "V17", "V12", "V10",
-        "risk_score", "is_confirmed_fraud",
-    ]
-    high_risk[[c for c in cols if c in high_risk.columns]].to_sql(
+    cols = ["batch_start_sec", "batch_end_sec", "Time", "Amount",
+            "rule_score", "if_score", "combined_score", "is_confirmed_fraud"]
+    out[[c for c in cols if c in out.columns]].to_sql(
         "fraud_alerts", eng, if_exists="append", index=False, method="multi"
     )
-    log.info("Inserted %d rows into fraud_alerts", len(high_risk))
 
 
 def verify(eng):
@@ -114,21 +104,24 @@ def verify(eng):
         rule_only = conn.execute(
             text("SELECT COUNT(*) FROM fraud_alerts WHERE is_confirmed_fraud = false")
         ).scalar()
+        avg_score = conn.execute(
+            text("SELECT ROUND(AVG(combined_score)::numeric, 4) FROM fraud_alerts")
+        ).scalar()
+
     log.info(
-        "fraud_alerts — total: %d | confirmed fraud: %d | rule-flagged only: %d",
-        total, confirmed, rule_only,
+        "fraud_alerts | total: %d | confirmed fraud: %d | rule/IF-flagged: %d | avg combined_score: %s",
+        total, confirmed, rule_only, avg_score,
     )
 
 
 def main():
     eng = engine()
-    ensure_fraud_alerts_table(eng)
+    reset_fraud_alerts(eng)
 
-    # Run 3 consecutive 1-hour batches to demonstrate the pipeline
+    scorer = CombinedScorer.load(model_path=MODEL_PATH)
+
     for window in range(3):
-        batch_start = window * 3600.0
-        batch_end = batch_start + 3600.0
-        run_batch(eng, batch_start, batch_end)
+        run_batch(eng, scorer, float(window * 3600), float((window + 1) * 3600))
 
     verify(eng)
     log.info("Test run complete.")
