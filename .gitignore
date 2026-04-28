@@ -1,4 +1,8 @@
 .env
+airflow/airflow.env
+airflow/airflow.cfg
+airflow/logs/
+airflow/plugins/
 __pycache__/
 *.pyc
 *.pyo
