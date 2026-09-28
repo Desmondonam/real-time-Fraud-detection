@@ -17,7 +17,8 @@ services:
       - _AIRFLOW_WWW_USER_USERNAME=admin
       - _AIRFLOW_WWW_USER_PASSWORD=admin
       # Install extra Python packages the DAG needs
-      - _PIP_ADDITIONAL_REQUIREMENTS=scikit-learn==1.5.1 joblib psycopg2-binary python-dotenv
+      # numpy<2: the image's pandas is compiled against numpy 1.x
+      - _PIP_ADDITIONAL_REQUIREMENTS=scikit-learn==1.5.1 numpy<2 joblib psycopg2-binary python-dotenv
       # Fraud DB credentials — read by the DAG via os.getenv()
       - DB_HOST=host.docker.internal
       - DB_PORT=5432
