@@ -1,5 +1,8 @@
 # Real-Time Fraud Detection System
 
+![alt text](image.png)
+
+
 [![CI](https://github.com/Desmondonam/real-time-Fraud-detection/actions/workflows/ci.yml/badge.svg)](https://github.com/Desmondonam/real-time-Fraud-detection/actions/workflows/ci.yml)
 
 An end-to-end, real-time fraud detection pipeline. A Kafka producer replays credit card transactions as a live stream, a consumer scores every event with a hybrid rule engine + Isolation Forest model and writes results to PostgreSQL, Airflow retrains and promotes the model on a schedule, and Grafana shows the live picture. Everything starts with a single `docker compose up`.
