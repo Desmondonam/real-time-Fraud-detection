@@ -4,6 +4,10 @@
 
 An end-to-end, real-time fraud detection pipeline. A Kafka producer replays credit card transactions as a live stream, a consumer scores every event with a hybrid rule engine + Isolation Forest model and writes results to PostgreSQL, Airflow retrains and promotes the model on a schedule, and Grafana shows the live picture. Everything starts with a single `docker compose up`.
 
+![Grafana dashboard: live fraud detection stream](docs/images/dashboard.png)
+
+<!-- Write-up: add the Medium article link here -->
+
 ---
 
 ## Table of Contents
@@ -23,6 +27,7 @@ An end-to-end, real-time fraud detection pipeline. A Kafka producer replays cred
   - [Stage 4 — Retraining (Airflow)](#stage-4--retraining-airflow)
   - [Stage 5 — Dashboard (Grafana)](#stage-5--dashboard-grafana)
 - [Model Performance](#model-performance)
+- [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
 - [Database Schema](#database-schema)
 - [Script Reference](#script-reference)
 - [Troubleshooting](#troubleshooting)
@@ -141,6 +146,10 @@ real-time-Fraud-detection/
 │
 ├── scripts/
 │   └── schema.sql               # Tables + views (idempotent)
+│
+├── tests/                       # pytest suite (no services needed)
+├── .github/workflows/ci.yml     # CI: pytest, image builds, DAG import
+├── docs/images/                 # README screenshots
 │
 └── models/                      # Model bundle when training on the host (gitignored)
 ```
@@ -401,6 +410,49 @@ Transactions are sorted by `Time` and split into three consecutive windows. Noth
 - **The tune window is harder than the test window** (tune F1 0.20 vs test 0.31). With only 57 and 75 fraud cases, these numbers carry wide error bars: a handful of cases moves recall by several points.
 - **In-sample numbers are noticeably better** (fit-window F1 0.48). The previous version of this README reported in-sample figures (F1 0.475 from training and evaluating on all rows, with label-derived rules and contamination) as out-of-sample. They should not be compared with the table above.
 - Hyperparameters such as the rule tail quantile (1%), score weights (0.4 / 0.6) and the number of trees were fixed up front, not searched against the test window.
+
+---
+
+## Design Decisions and Trade-offs
+
+### Evaluation
+
+| Decision | Why | Cost |
+|---|---|---|
+| **Time-based fit / tune / test split** instead of a random split or k-fold | Fraud patterns drift, and a model is always applied to *future* transactions. A random split lets the model learn from the future. | The test window holds only 75 fraud cases, so metrics carry wide error bars. A rolling-origin backtest over several cut-offs would give a better estimate. |
+| **Everything learned is learned on the fit window**: rule features, thresholds, Amount μ/σ, IF, and the score scaler | Label- or test-derived parameters (fraud-rate `contamination`, rule thresholds from full-dataset EDA, full-data scaling) inflated the old numbers. | The held-out numbers are lower. They are also the ones that would hold up in production. |
+| **PR-AUC and precision/recall headline the results, not ROC-AUC** | At 0.13% fraud, ROC-AUC is dominated by easy negatives (0.96 here, yet fewer than 1 in 4 alerts is fraud). | A less flattering headline number. |
+| **Threshold = best F1 on the tune window** | Simple, label-efficient and reproducible. | F1 weighs a missed fraud and a false alarm equally. A real deployment would pick the threshold from an alert budget or from the cost of a chargeback against the cost of an analyst review. |
+| **Score weights (0.4 / 0.6) and other hyperparameters fixed up front** | Searching them against 57 tune-window frauds would overfit, and searching against the test window would leak. | They are probably not optimal. |
+
+### Model
+
+| Decision | Why | Cost |
+|---|---|---|
+| **Isolation Forest + rules**, not a supervised classifier | Labels in fraud arrive late and are incomplete. An anomaly detector can flag patterns that were never labelled, and the rules give analysts a readable reason. | The dataset *does* have labels, and a supervised gradient-boosted model would very likely beat PR-AUC 0.18. The rules already use labels from the fit window, so this is semi-supervised rather than purely unsupervised. |
+| **Time-of-day multiplier** (night ×1.5, business hours ×0.75) | A common domain prior. | It assumes `Time = 0` is midnight, which the dataset does not state. It is a hand-set assumption, not a learned or validated feature. |
+| **No merchant categories** | The data has none. Bucketing Amount into "Electronics" and similar labels invented information. | Fewer charts. |
+
+### Streaming
+
+| Decision | Why | Cost |
+|---|---|---|
+| **Replay the CSV through Kafka, paced by `Time`** | Exercises the real moving parts (broker, partitions, consumer group, offsets, back-pressure) on a public dataset. | It is a simulation: one producer, a perfectly ordered stream, and no late or out-of-order events. |
+| **Key = `txn_id`** | The dataset has no card or customer id. | No per-card ordering. With real data the key should be the card or account, so that per-entity features (velocity, spend vs. history) can be computed with state. |
+| **Micro-batches (≤ 500 events / 100 ms) instead of one message at a time** | Scoring is vectorised, so a batch of 30 costs about the same as a batch of 1. Every event still gets its own score. | Up to 100 ms of extra latency at low traffic. |
+| **At-least-once + idempotent upsert** instead of Kafka transactions | Kafka's exactly-once covers Kafka-to-Kafka. The sink here is Postgres, so the simplest correct design is: write with `ON CONFLICT (txn_id) DO NOTHING`, then commit offsets. | A crash replays a batch, costing wasted work but no duplicate rows. |
+| **Offsets committed only after a durable Postgres commit** | No scored event is ever acknowledged before it is safely stored. | The fsync costs about 110 ms per batch on Docker Desktop. `synchronous_commit=off` would remove it, at the risk of losing acknowledged rows. |
+| **Labels are not in the event**; `fraud_alerts` joins them afterwards | Mirrors reality: chargebacks arrive days or weeks later. | Live precision is only known in hindsight. |
+
+### Operations
+
+| Decision | Why | Cost |
+|---|---|---|
+| **Airflow retrains; it does not score** | Batch and streaming have different jobs. The old hourly DAG called itself real time while processing hour-old batches. | Two systems to run instead of one. |
+| **Quality gate before promotion** (held-out PR-AUC floor + max regression) | A bad retrain should never reach the live consumer. | On this static dataset every retrain is identical; the gate matters once the training window rolls forward. |
+| **One pickled bundle + atomic `os.replace` + mtime hot reload** instead of a model registry such as MLflow | No extra service; the swap is atomic; the consumer never restarts. | No built-in lineage or one-click rollback, and only `model_metrics` keeps history. Pickles must come from a trusted source. scikit-learn is pinned to the same version in both images so the bundle loads everywhere. |
+| **Dashboard queries Postgres directly** | One datasource; the numbers on screen are the stored results. | The panels scan `scored_transactions`. At scale the consumer should export Prometheus metrics for throughput and latency, and keep SQL for business views. |
+| **Single-node Kafka and Postgres, Airflow `standalone`, default credentials** | One `docker compose up` on a laptop. | Not highly available and not hardened. It is a development stack, not a production deployment. |
 
 ---
 
