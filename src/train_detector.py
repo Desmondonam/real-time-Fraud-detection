@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -146,11 +147,33 @@ def train(df: pd.DataFrame) -> CombinedScorer:
     print_report(metrics, scorer.threshold)
 
     scorer.metadata = {
+        "model_version": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         "tune_start_time": float(tune_df["Time"].iloc[0]),
         "test_start_time": float(test_df["Time"].iloc[0]),
         "metrics": metrics,
     }
     return scorer
+
+
+def publish_metrics(engine, scorer: CombinedScorer) -> None:
+    """Appends the model's per-window metrics to model_metrics (for Grafana)."""
+    rows = [
+        {
+            "model_version": scorer.metadata["model_version"],
+            "split": split,
+            "n_rows": m["rows"],
+            "fraud_rows": m["fraud_rows"],
+            "roc_auc": m["roc_auc"],
+            "pr_auc": m["pr_auc"],
+            "alert_precision": m["precision"],
+            "recall": m["recall"],
+            "f1": m["f1"],
+            "threshold": scorer.threshold,
+        }
+        for split, m in scorer.metadata["metrics"].items()
+    ]
+    pd.DataFrame(rows).to_sql("model_metrics", engine, if_exists="append", index=False)
+    log.info("Published metrics for model %s", scorer.metadata["model_version"])
 
 
 def main():
@@ -167,6 +190,8 @@ def main():
 
     scorer = train(load_transactions(args.csv))
     scorer.save(args.model_path)
+    if not args.csv:
+        publish_metrics(get_engine(), scorer)
 
     metrics_path = os.path.join(os.path.dirname(os.path.abspath(args.model_path)), "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:

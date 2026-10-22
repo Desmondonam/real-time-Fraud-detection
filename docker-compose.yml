@@ -3,9 +3,14 @@
 #   docker compose up -d --build
 #
 # Postgres → bootstrap (ingest CSV + train model, skipped when already done)
+#          → Kafka producer (replays the CSV) → consumer (scores each event)
 #          → Airflow (http://localhost:8080) and Grafana (http://localhost:3001)
 #
 # Credentials come from .env (see .env.example); the defaults below are for local use only.
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP: kafka:9092
+  KAFKA_TOPIC: transactions
 
 x-db-env: &db-env
   DB_HOST: postgres
@@ -51,6 +56,68 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: fraud_kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "29092:29092"   # for running the producer/consumer from the host
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # Replays creditcard.csv into the `transactions` topic in Time order.
+  # REPLAY_SPEEDUP=60 → the 48-hour dataset plays out in ~48 minutes.
+  producer:
+    build: .
+    container_name: fraud_producer
+    command: python -m src.streaming.producer
+    environment:
+      <<: *kafka-env
+      REPLAY_CSV: /app/data/creditcard.csv
+      REPLAY_SPEEDUP: ${REPLAY_SPEEDUP:-60}
+      REPLAY_START_TIME: ${REPLAY_START_TIME:-0}
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      consumer:
+        condition: service_started
+
+  # Scores every event and writes it to scored_transactions.
+  consumer:
+    build: .
+    container_name: fraud_consumer
+    command: python -m src.streaming.consumer
+    environment:
+      <<: [*kafka-env, *db-env]
+      MODEL_PATH: /app/models/fraud_scorer.pkl
+    volumes:
+      - models:/app/models:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   airflow:
     build: ./docker/airflow

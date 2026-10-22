@@ -135,7 +135,7 @@ def load_to_postgres(df: pd.DataFrame, engine) -> None:
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False)
     buf.seek(0)
-    columns = ", ".join(f'"{c}"' for c in EXPECTED_COLUMNS)
+    columns = ", ".join(f'"{c}"' for c in df.columns)
 
     raw = engine.raw_connection()
     try:
@@ -186,7 +186,9 @@ def main():
     log.info("Raw shape: %s", df.shape)
 
     validate_schema(df)
-    df = df[EXPECTED_COLUMNS]          # enforce column order after validation
+    df = df[EXPECTED_COLUMNS].copy()   # enforce column order after validation
+    # txn_id = row position in the CSV; the Kafka producer uses the same id
+    df.insert(0, "txn_id", df.index.astype("int64"))
     df = handle_nulls(df)
 
     df["Class"] = df["Class"].astype(int)

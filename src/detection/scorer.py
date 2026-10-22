@@ -104,6 +104,18 @@ class CombinedScorer:
 
     # ── inference ─────────────────────────────────────────────────────────────
 
+    def split_for(self, event_time: pd.Series) -> pd.Series:
+        """
+        Labels each event with the window it fell in when this model was
+        trained: "fit", "tune" or "test". Only "test" events are out-of-sample.
+        """
+        tune_start = self.metadata.get("tune_start_time", float("inf"))
+        test_start = self.metadata.get("test_start_time", float("inf"))
+        split = pd.Series("fit", index=event_time.index)
+        split[event_time >= tune_start] = "tune"
+        split[event_time >= test_start] = "test"
+        return split
+
     def score(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Returns df with four new columns appended.

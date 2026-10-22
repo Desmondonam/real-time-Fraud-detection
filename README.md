@@ -1,6 +1,6 @@
 # Real-Time Fraud Detection System
 
-An end-to-end fraud detection pipeline that ingests credit card transaction data into PostgreSQL, scores every transaction using a hybrid rule engine and Isolation Forest model, orchestrates hourly batch processing with Apache Airflow, and displays live results in a Grafana dashboard.
+An end-to-end, real-time fraud detection pipeline. A Kafka producer replays credit card transactions as a live stream, a consumer scores every event with a hybrid rule engine + Isolation Forest model and writes results to PostgreSQL, Airflow retrains and promotes the model on a schedule, and Grafana shows the live picture. Everything starts with a single `docker compose up`.
 
 ---
 
@@ -14,10 +14,11 @@ An end-to-end fraud detection pipeline that ingests credit card transaction data
 - [Quick Start (Docker Compose)](#quick-start-docker-compose)
 - [Running Scripts Locally](#running-scripts-locally)
 - [How the System Works](#how-the-system-works)
-  - [Stage 1 — Data Ingestion and Cleaning](#stage-1--data-ingestion-and-cleaning)
+  - [Stage 1 — Data Ingestion](#stage-1--data-ingestion)
   - [Stage 2 — Detection Logic](#stage-2--detection-logic)
-  - [Stage 3 — ETL Pipeline (Airflow)](#stage-3--etl-pipeline-airflow)
-  - [Stage 4 — Dashboard (Grafana)](#stage-4--dashboard-grafana)
+  - [Stage 3 — Real-Time Scoring (Kafka)](#stage-3--real-time-scoring-kafka)
+  - [Stage 4 — Retraining (Airflow)](#stage-4--retraining-airflow)
+  - [Stage 5 — Dashboard (Grafana)](#stage-5--dashboard-grafana)
 - [Model Performance](#model-performance)
 - [Database Schema](#database-schema)
 - [Script Reference](#script-reference)
@@ -27,70 +28,56 @@ An end-to-end fraud detection pipeline that ingests credit card transaction data
 
 ## What It Does
 
-This system simulates a production fraud detection pipeline on the [Kaggle Credit Card Fraud Detection dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) (284,807 transactions, 0.17% fraud rate).
+The system runs on the [Kaggle Credit Card Fraud Detection dataset](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) (284,807 transactions over ~48 hours, 0.17% fraud).
 
-It:
-
-1. **Ingests** the raw CSV into PostgreSQL, validating schema and handling nulls.
-2. **Scores** every transaction using two complementary methods — a transparent rule engine and an unsupervised Isolation Forest — combined into a single risk score.
-3. **Simulates streaming** via an Airflow DAG that processes the dataset in one-hour time windows on an hourly schedule, writing high-risk transactions to a `fraud_alerts` table.
-4. **Visualises** live alert volume and fraud rate in Grafana, auto-refreshing every 30 seconds.
+1. **Ingests** the raw CSV into PostgreSQL (schema validation, null handling, `COPY` bulk load). This is the system of record and the source of the (delayed) fraud labels.
+2. **Trains** a scorer with a **time-based split**: everything is learned on the earliest 60% of transactions, the alert threshold is tuned on the next 20%, and metrics are reported on the final 20%.
+3. **Streams** transactions through **Kafka**: a producer replays the CSV in time order (60× real time by default) and a consumer scores **each event** as it arrives and writes the result to `scored_transactions`. On a laptop running Docker Desktop, end-to-end latency is p50 ≈ 100–200 ms and p95 ≈ 250–600 ms.
+4. **Retrains** daily with **Airflow**. A candidate model is promoted only if its held-out PR-AUC passes a quality gate, and the consumer hot-reloads it without restarting.
+5. **Visualises** throughput, latency, alerts, live precision and held-out metrics in **Grafana**, refreshing every 5 seconds.
 
 ---
 
 ## Architecture
 
 ```
-Raw CSV (144 MB)
-      │
-      │  DVC track + local remote
-      ▼
-┌─────────────────────────────┐
-│  src/ingest_and_clean.py    │  Schema validation, null handling
-│                             │
-└────────────┬────────────────┘
-             │  284,807 rows
-             ▼
-┌────────────────────────────────────────┐
-│          PostgreSQL                    │
-│                                        │
-│  transactions      (284,807 rows)      │
-│  fraud_alerts      (1,809+ rows)       │
-│  fraud_alerts_enriched  (view)         │
-│  hourly_transaction_summary  (view)    │
-└───────┬──────────────────┬────────────┘
-        │                  │
-        │ reads            │ reads
-        ▼                  ▼
-┌───────────────┐   ┌──────────────────────────────┐
-│  Airflow DAG  │   │        Grafana Dashboard       │
-│  (hourly)     │   │   localhost:3001               │
-│               │   │                                │
-│  1h window    │   │  • Hourly alert volume         │
-│  → score      │   │  • Live fraud rate             │
-│  → alert      │   │  • Alerts by dataset hour      │
-└──────┬────────┘   │  • High-risk transactions table│
-       │            └──────────────────────────────┘
-       ▼
-┌──────────────────────────────────────┐
-│  src/detection/  (CombinedScorer)    │
-│                                      │
-│  rule_engine.py                      │
-│    Amount > 2σ / 3σ           +score │
-│    Night hours (00-05)        ×1.5   │
-│    Business hours (09-17)     ×0.75  │
-│    6 PCA rules learned on     +score │
-│      the training window             │
-│                                      │
-│  isolation_forest.py                 │
-│    30 features (V1-V28,              │
-│    Amount, time_hour)                │
-│    contamination = "auto"            │
-│                                      │
-│  scorer.py  (CombinedScorer)         │
-│    combined = 0.4×rule + 0.6×IF      │
-│    flag if combined ≥ tuned thresh.  │
-└──────────────────────────────────────┘
+                         creditcard.csv (DVC)
+                       │                      │
+          bootstrap job│                      │replayed in Time order
+     (ingest + train,  │                      ▼
+      runs once)       │          ┌──────────────────────┐
+                       │          │  Kafka producer      │  no labels in events
+                       │          └──────────┬───────────┘
+                       │                     │ topic: transactions (3 partitions)
+                       ▼                     ▼
+┌──────────────────────────────┐  ┌──────────────────────────────────────┐
+│ PostgreSQL                   │  │  Kafka consumer                      │
+│                              │  │  micro-batch ≤500 msgs / 100 ms      │
+│  transactions  (+ labels)    │◀─│  CombinedScorer → upsert → commit    │
+│  scored_transactions         │  │  offsets (at-least-once, idempotent) │
+│  model_metrics               │  │  hot-reloads the model bundle        │
+│  fraud_alerts (view)         │  └──────────────────▲───────────────────┘
+│  hourly_transaction_summary  │                     │ models volume
+└───────┬───────────────▲──────┘                     │
+        │ reads         │ metrics        ┌───────────┴──────────────────┐
+        ▼               └────────────────│ Airflow: fraud_model_        │
+┌──────────────────────────┐             │ retraining (@daily)          │
+│ Grafana (localhost:3001) │             │ train → quality gate →       │
+│ throughput · latency ·   │             │ promote                      │
+│ alerts · live precision ·│             └──────────────────────────────┘
+│ held-out metrics         │
+└──────────────────────────┘
+```
+
+**Scoring model** (`src/detection/`):
+
+```
+rule_engine.py       Amount > 2σ / 3σ (train-window μ, σ)        +score
+                     6 PCA rules learned on the train window    +score
+                     Night (00-05) ×1.5 · Business (09-17) ×0.75
+isolation_forest.py  V1-V28 + Amount + time_hour, contamination="auto"
+scorer.py            combined = 0.4 × rule + 0.6 × IF
+                     alert if combined ≥ threshold (tuned on the tune window)
 ```
 
 ---
@@ -100,16 +87,14 @@ Raw CSV (144 MB)
 | Layer | Technology |
 |---|---|
 | Language | Python 3.12 |
-| Database | PostgreSQL 16 (Docker) |
-| Data versioning | DVC 3.60 |
+| Streaming | Apache Kafka 3.8 (KRaft, single node) + confluent-kafka |
+| Database | PostgreSQL 16 |
 | ML / Scoring | scikit-learn (IsolationForest, MinMaxScaler) |
 | Orchestration | Apache Airflow 2.10 |
 | Dashboard | Grafana OSS 11.4 |
-| Runtime | Docker Compose (Postgres, Airflow, Grafana, bootstrap job) |
-| DB access | SQLAlchemy 2.0 + psycopg2 |
-| Data wrangling | pandas 2.x |
-| Model persistence | joblib |
-| Config | python-dotenv |
+| Runtime | Docker Compose |
+| Data versioning | DVC 3.60 |
+| Data access | pandas, SQLAlchemy, psycopg2 |
 
 ---
 
@@ -118,48 +103,43 @@ Raw CSV (144 MB)
 ```
 real-time-Fraud-detection/
 │
-├── docker-compose.yml           # Whole stack: Postgres, bootstrap, Airflow, Grafana
-├── Dockerfile                   # App image (bootstrap job)
+├── docker-compose.yml           # Whole stack: Postgres, Kafka, producer, consumer,
+│                                #   bootstrap job, Airflow, Grafana
+├── Dockerfile                   # App image (bootstrap, producer, consumer)
 ├── requirements.txt             # Pinned runtime dependencies
 ├── .env.example                 # Credentials template (copy to .env)
 │
 ├── data/
-│   ├── creditcard.csv.dvc       # DVC pointer — actual file managed by DVC
-│   └── .gitignore
+│   └── creditcard.csv.dvc       # DVC pointer — actual file managed by DVC
 │
 ├── src/
-│   ├── ingest_and_clean.py      # Stage 1: load CSV → PostgreSQL (COPY)
+│   ├── ingest_and_clean.py      # Stage 1: CSV → PostgreSQL (COPY)
 │   ├── train_detector.py        # Time-split training + held-out evaluation
-│   ├── test_etl_run.py          # Run ETL logic without Airflow (dev)
-│   └── detection/
-│       ├── __init__.py
-│       ├── rule_engine.py       # Rule-based scorer (rules learned on train window)
-│       ├── isolation_forest.py  # IF training + inference
-│       └── scorer.py            # CombinedScorer (rule + IF), model bundle I/O
+│   ├── detection/
+│   │   ├── rule_engine.py       # Rule scorer (rules learned on the train window)
+│   │   ├── isolation_forest.py  # IF training + inference
+│   │   └── scorer.py            # CombinedScorer, model bundle I/O
+│   └── streaming/
+│       ├── producer.py          # Replays the CSV into Kafka
+│       └── consumer.py          # Scores each event, writes to Postgres
 │
-├── airflow/
-│   └── dags/
-│       └── fraud_etl_dag.py     # Hourly Airflow DAG
+├── airflow/dags/
+│   └── fraud_retraining_dag.py  # Daily retrain → quality gate → promote
 │
 ├── docker/
 │   ├── airflow/Dockerfile       # Airflow image + scikit-learn
 │   └── postgres/01-create-databases.sql
 │
-├── grafana/
-│   └── provisioning/
-│       ├── datasources/
-│       │   └── fraud_db.yaml          # Reads credentials from the container env
-│       └── dashboards/
-│           ├── dashboard.yaml
-│           └── fraud_detection.json   # Auto-provisioned dashboard
+├── grafana/provisioning/
+│   ├── datasources/fraud_db.yaml      # Reads credentials from the container env
+│   └── dashboards/
+│       ├── dashboard.yaml
+│       └── fraud_detection.json       # Auto-provisioned dashboard
 │
 ├── scripts/
-│   ├── schema.sql               # Tables + dashboard views (idempotent)
-│   └── populate_alerts.py       # Backfills all 48 batch windows
+│   └── schema.sql               # Tables + views (idempotent)
 │
-├── models/                      # Model bundle when training locally (gitignored)
-├── .dvc/                        # DVC configuration
-└── README.md
+└── models/                      # Model bundle when training on the host (gitignored)
 ```
 
 ---
@@ -168,8 +148,8 @@ real-time-Fraud-detection/
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Docker Desktop / Docker Engine | Compose v2 | Runs the whole stack |
-| DVC | 3.60+ | `pip install dvc` — to fetch `data/creditcard.csv` |
+| Docker Desktop / Docker Engine | Compose v2 | Runs the whole stack (~3 GB RAM) |
+| DVC | 3.60+ | `pip install dvc`, to fetch `data/creditcard.csv` |
 | Python | 3.12 | Only needed to run scripts or tests outside Docker |
 
 ---
@@ -181,49 +161,57 @@ git clone https://github.com/Desmondonam/real-time-Fraud-detection.git
 cd real-time-Fraud-detection
 
 dvc pull                 # fetch data/creditcard.csv (see "DVC pull fails" below)
-cp .env.example .env     # optional — set your own DB password
+cp .env.example .env     # optional: set your own DB password
 docker compose up -d --build
 ```
 
 What happens:
 
-1. **postgres** starts and creates the `fraud_detection` and `airflow_metadata` databases.
-2. **bootstrap** (one-shot) applies `scripts/schema.sql`, loads the CSV with `COPY`, then trains the model with the time-based split and prints the held-out metrics. Both steps are skipped if their output already exists, so later `up`s are fast. Follow it with `docker compose logs -f bootstrap`.
-3. **airflow** starts once bootstrap has finished, and **grafana** starts as soon as Postgres is healthy.
+1. **postgres** and **kafka** start.
+2. **bootstrap** (one-shot) applies `scripts/schema.sql`, loads the CSV with `COPY`, trains the model with the time-based split and records its held-out metrics. Each step is skipped when its output already exists, so later `up`s are fast. Follow it with `docker compose logs -f bootstrap`.
+3. **consumer** loads the model and subscribes to the `transactions` topic, then **producer** starts replaying.
+4. **airflow** and **grafana** come up alongside.
 
 | Service | URL | Login |
 |---|---|---|
 | Grafana | [http://localhost:3001](http://localhost:3001) | admin / admin |
 | Airflow | [http://localhost:8080](http://localhost:8080) | admin / admin |
 | Postgres | `localhost:5433` | values from `.env` (default postgres / postgres) |
+| Kafka | `localhost:29092` | — |
 
 Postgres is published on **5433** so it does not clash with a local install on 5432 (override with `POSTGRES_HOST_PORT`).
+
+Replay speed and start point are configurable in `.env`:
+
+```env
+REPLAY_SPEEDUP=60          # dataset seconds per wall-clock second (0 = as fast as possible)
+REPLAY_START_TIME=145248   # e.g. start at the held-out test window
+```
 
 Useful commands:
 
 ```bash
-docker compose logs -f bootstrap        # ingest + training output
-docker compose down                     # stop (data and model are kept in volumes)
-docker compose down -v                  # stop and wipe Postgres, model and Grafana volumes
-docker compose run --rm bootstrap python src/train_detector.py   # force a retrain
+docker compose logs -f consumer         # scoring progress
+docker compose up -d producer           # replay again (already-scored txns are skipped)
+docker compose down                     # stop (data, model and offsets are kept in volumes)
+docker compose down -v                  # stop and wipe all volumes
 ```
 
 ---
 
 ## Running Scripts Locally
 
-Everything can also be run from the host against the compose Postgres (`DB_HOST=localhost`, `DB_PORT=5433` in `.env`):
+Everything can also be run from the host against the compose services (`DB_HOST=localhost`, `DB_PORT=5433` in `.env`; Kafka on `localhost:29092`):
 
 ```bash
 pip install -r requirements.txt
 python src/ingest_and_clean.py                          # schema + COPY load
 python src/train_detector.py                            # or: --csv data/creditcard.csv
-python scripts/populate_alerts.py                       # backfill all 48 windows
+python -m src.streaming.consumer                        # score events
+python -m src.streaming.producer --speedup 600          # replay at 600×
 ```
 
-### Train the detection model
-
-Sorts transactions by `Time`, fits the rule thresholds and Isolation Forest on the first 60%, tunes the decision threshold on the next 20%, and reports metrics on the final 20% (see [Model Performance](#model-performance)):
+`train_detector.py` prints metrics for every window:
 
 ```
 ================================================================
@@ -235,33 +223,28 @@ Sorts transactions by `Time`, fits the rule thresholds and Isolation Forest on t
   test     56,962     75   0.9605  0.1756  0.231  0.453  0.306
 ```
 
-The model bundle (IF model, learned rules, tuned threshold, split cut-offs and metrics) is saved to `models/fraud_scorer.pkl`, and the metrics are also written to `models/metrics.json`. Inside Docker it lives in the `models` volume instead, so containers and host never mix scikit-learn versions.
+The model bundle (IF model, learned rules, tuned threshold, split cut-offs and metrics) is saved to `models/fraud_scorer.pkl`, with the metrics also written to `models/metrics.json`. Inside Docker it lives in the `models` volume instead, so containers and host never mix scikit-learn versions.
 
 ---
 
 ## How the System Works
 
-### Stage 1 — Data Ingestion and Cleaning
+### Stage 1 — Data Ingestion
 
 **Script:** `src/ingest_and_clean.py`
 
-The raw `creditcard.csv` (284,807 rows × 31 columns) goes through three steps before it reaches PostgreSQL:
+1. **Schema** — applies `scripts/schema.sql` (tables, indexes, views; idempotent).
+2. **Validation** — checks all 31 expected columns (`Time`, `V1`–`V28`, `Amount`, `Class`). Extra columns are dropped; missing columns raise an error.
+3. **Null handling** — nulls in `V1`–`V28`, `Time` or `Amount` are filled with the column median; rows with a null `Class` are dropped.
+4. **Bulk load** — assigns `txn_id` (the row's position in the CSV, which the producer also uses) and loads with `COPY`.
 
-1. **Schema validation** — Checks that all 31 expected columns are present (`Time`, `V1`–`V28`, `Amount`, `Class`). Extra columns are dropped; missing columns raise an error.
-
-2. **Null handling** — Any null values in `V1`–`V28` or `Amount` are filled with that column's median. Rows with a null `Class` are dropped entirely (they cannot be labelled).
-
-3. **Bulk load** — Data is inserted into the `transactions` table in 5,000-row chunks via SQLAlchemy.
-
-The `Time` column is left as-is (seconds since the first transaction, ranging 0–172,792, covering approximately 48 hours of data).
-
----
+`Amount` is kept in raw currency units. `Time` is seconds since the first transaction (0–172,792, ≈ 48 hours).
 
 ### Stage 2 — Detection Logic
 
 **Package:** `src/detection/`
 
-Every transaction receives three scores, then a combined flag.
+Every transaction receives a rule score, an Isolation Forest score and a combined score.
 
 #### Rule Engine (`rule_engine.py`)
 
@@ -289,18 +272,16 @@ The total is divided by the theoretical maximum (all points × 1.5) to produce a
 
 #### Isolation Forest (`isolation_forest.py`)
 
-An unsupervised anomaly detection model trained on the training window (first 60% of transactions by time). Key parameters:
+An unsupervised anomaly detector trained on the training window (first 60% of transactions by time).
 
 | Parameter | Value | Reason |
 |---|---|---|
 | `n_estimators` | 200 | More trees → more stable scores |
 | `contamination` | `"auto"` | Not set from the fraud rate (that would leak labels); the offset it controls is cancelled by the [0, 1] rescaling anyway |
-| `max_samples` | `'auto'` | Uses min(256, n_samples) sub-samples per tree |
+| `max_samples` | `'auto'` | min(256, n_samples) sub-samples per tree |
 | Features | V1–V28 + Amount + `time_hour` | 30 features total |
 
-The `time_hour` feature is derived as `int((Time % 86400) / 3600)` — the hour of day (0–23), assuming the dataset starts at midnight.
-
-The `Class` label is never shown to the model. The `decision_function()` output is inverted (more anomalous → higher raw score) and scaled to [0, 1] using `MinMaxScaler` fitted on the training window.
+`time_hour` is `int((Time % 86400) / 3600)`, the hour of day assuming the dataset starts at midnight. The `Class` label is never shown to the model. `decision_function()` is inverted (more anomalous → higher) and scaled to [0, 1] with a `MinMaxScaler` fitted on the training window.
 
 #### Combined Scorer (`scorer.py`)
 
@@ -308,73 +289,61 @@ The `Class` label is never shown to the model. The `decision_function()` output 
 combined_score = 0.4 × rule_score + 0.6 × if_score
 ```
 
-The Isolation Forest receives higher weight because it captures multivariate anomaly patterns that single-feature threshold rules miss. The rule engine is kept as an interpretable fast-path: clear-cut violations (e.g. V14 < −5) are always reflected in the score even if the IF disagrees.
+The Isolation Forest gets more weight because it captures multivariate anomalies that single-feature rules miss. The rule engine keeps clear-cut violations visible even when the IF disagrees.
 
-A transaction is flagged **high-risk** when `combined_score ≥ threshold`, where the threshold is the best-F1 cut-off on the *tune* window (currently 0.4908).
+A transaction is **high-risk** when `combined_score ≥ threshold`, where the threshold is the best-F1 cut-off on the *tune* window (currently 0.4908). The IF model, rules, threshold, split cut-offs and metrics are saved together in one bundle (`fraud_scorer.pkl`).
 
----
+### Stage 3 — Real-Time Scoring (Kafka)
 
-### Stage 3 — ETL Pipeline (Airflow)
+**Producer** (`src/streaming/producer.py`) reads the CSV, sorts by `Time`, and sends each row as a JSON event to the `transactions` topic, keyed by `txn_id`. Events are paced by their `Time` gaps divided by `REPLAY_SPEEDUP`. Each event carries a `produced_at` timestamp; **`Class` is not included**, because nobody knows it at authorisation time.
 
-**DAG:** `airflow/dags/fraud_etl_dag.py`  
-**DAG ID:** `fraud_etl_pipeline`  
-**Schedule:** `@hourly`
+**Consumer** (`src/streaming/consumer.py`) runs this loop:
 
-The DAG simulates a streaming workload by mapping each Airflow execution hour to a one-hour window of the dataset's `Time` column. Because the dataset covers ~48 hours, the mapping wraps around (mod 48) so the DAG can run indefinitely.
+1. Pull up to 500 events, or whatever has arrived within 100 ms.
+2. Score them with `CombinedScorer`. This is vectorised over the micro-batch, but every event gets its own score.
+3. Insert into `scored_transactions` with `ON CONFLICT (txn_id) DO NOTHING`.
+4. Commit the Kafka offsets, only after the database transaction has committed.
+
+This gives **at-least-once delivery with idempotent writes**: a crash between steps 3 and 4 re-delivers the batch, and the duplicates are ignored. Each row also records `latency_ms` (score time − `produced_at`), the model version, and which window of that model (`fit` / `tune` / `test`) the event falls in, so the dashboard can separate in-sample from out-of-sample alerts.
+
+The consumer checks the model file every 30 s and reloads it when Airflow promotes a new one.
+
+Measured on a laptop with Docker Desktop at 60× replay, one loop of about 30 events breaks down as roughly: about 110 ms waiting for messages, about 70 ms scoring, about 110 ms for the Postgres insert and commit (fsync), and about 8 ms for the offset commit. The fsync is the price of committing offsets only after the data is durable. `synchronous_commit = off` would remove it, but a Postgres crash could then lose rows whose offsets were already committed.
+
+### Stage 4 — Retraining (Airflow)
+
+**DAG:** `airflow/dags/fraud_retraining_dag.py` · **ID:** `fraud_model_retraining` · **Schedule:** `@daily`
 
 ```
-Airflow run hour N  →  dataset window [w×3600, (w+1)×3600)
-where w = N mod 48
+train_candidate  →  quality_gate  →  promote
 ```
 
-**Task graph:**
+- **`train_candidate`** runs the same time-split training as `train_detector.py` on the `transactions` table and saves a candidate bundle.
+- **`quality_gate`** (short-circuit) rejects the candidate if its test PR-AUC is below 0.10, or more than 0.02 below the live model.
+- **`promote`** atomically replaces the live bundle (`os.replace`) and records its metrics in `model_metrics`.
 
-```
-ensure_fraud_alerts_table
-          │
-          ▼
-fetch_and_score_batch   ← determines window, loads V1–V28 + Amount + Time,
-          │               runs CombinedScorer, returns high-risk rows as dict
-          ▼
-     write_alerts        ← inserts alert rows into fraud_alerts table
-          │
-          ▼
-     log_summary         ← logs batch statistics to Airflow task logs
-```
+On this static dataset every retrain sees the same rows. In production the training window would roll forward as newly labelled transactions arrive. Retries: 2, five minutes apart.
 
-**`ensure_fraud_alerts_table`** — Creates the `fraud_alerts` table if it does not exist. Uses `CREATE TABLE IF NOT EXISTS` so it is fully idempotent.
+### Stage 5 — Dashboard (Grafana)
 
-**`fetch_and_score_batch`** — Loads all feature columns for the current window from the `transactions` table, runs `CombinedScorer.load()` to score each row, and returns high-risk rows (plus any `Class == 1` confirmed fraud rows, regardless of model score) as a serialisable dict for XCom.
+**URL:** [http://localhost:3001](http://localhost:3001) (admin / admin) · **Refresh:** 5 s · **Time range:** last 15 minutes
 
-**`write_alerts`** — Writes the alert payload to `fraud_alerts`, appending to existing data. Stores `rule_score`, `if_score`, `combined_score`, and `is_confirmed_fraud` alongside the raw `Time` and `Amount` values.
+Fully provisioned from `grafana/provisioning/`, so there is no manual setup.
 
-**`log_summary`** — Emits a structured summary log including the window bounds, total transactions processed, flagged count, and rows inserted.
-
-**Retry policy:** 2 retries with a 5-minute delay — sufficient to recover from transient database connection failures.
-
----
-
-### Stage 4 — Dashboard (Grafana)
-
-**URL:** [http://localhost:3001](http://localhost:3001) — admin / admin  
-**Refresh:** Every 30 seconds  
-**Time range:** Last 48 hours (covers the full dataset window)
-
-The dashboard and its datasource are fully provisioned from `grafana/provisioning/` — no manual setup required after `docker compose up`.
-
-#### Panels
-
-| Panel | Type | Description |
+| Panel | Type | What it shows |
 |---|---|---|
-| **Total Alerts** | Stat | Count of all rows in `fraud_alerts` |
-| **Confirmed Fraud Cases** | Stat | Rows where `is_confirmed_fraud = true` |
-| **Fraud Confirmation Rate** | Stat | % of alerts that are confirmed fraud |
-| **Avg Combined Score** | Stat | Mean combined_score across all alerts |
-| **Dataset Fraud Rate** | Stat | Mean hourly fraud rate from `hourly_transaction_summary` |
-| **Hourly Alert Volume** | Time series | Total alerts and confirmed fraud over time (`flagged_at` axis) |
-| **Alert Volume by Dataset Hour** | Time series | Per-hour alert and confirmed fraud counts (hours 0–47) |
-| **Recent High-Risk Transactions** | Table | Sortable, colour-coded by combined_score; shows all score components |
-| **Live Fraud Rate by Dataset Hour** | Dual-axis line | Total transaction volume (left axis) vs fraud rate % (right axis) |
+| Events scored | Stat | Rows in `scored_transactions` |
+| Throughput | Stat | Events scored per second over the last minute |
+| p95 end-to-end latency | Stat | Producer send → scored, last 5 minutes |
+| Alerts raised | Stat | High-risk events |
+| Confirmed fraud among alerts | Stat | Alerts whose transaction is labelled fraud |
+| Model test PR-AUC | Stat | Held-out PR-AUC of the latest model |
+| Scored events and alerts | Time series | Per 10 s, on the wall-clock axis |
+| End-to-end latency | Time series | p50 / p95 per 10 s |
+| Latest alerts | Table | Newest 100 alerts with score components and window |
+| Live alert precision by window | Table | Precision split into fit / tune / test; only `test` is out-of-sample |
+| Held-out evaluation | Table | Offline metrics of the latest model, per window |
+| Dataset volume and fraud rate by hour | Time series | Static profile of the replayed data |
 
 #### No merchant categories
 
@@ -413,37 +382,43 @@ Transactions are sorted by `Time` and split into three consecutive windows. Noth
 - **In-sample numbers are noticeably better** (fit-window F1 0.48). The previous version of this README reported in-sample figures (F1 0.475 from training and evaluating on all rows, with label-derived rules and contamination) as out-of-sample. They should not be compared with the table above.
 - Hyperparameters such as the rule tail quantile (1%), score weights (0.4 / 0.6) and the number of trees were fixed up front, not searched against the test window.
 
+---
+
 ## Database Schema
 
 ### `transactions`
 
 | Column | Type | Description |
 |---|---|---|
+| txn_id | BIGINT (PK) | Row position in `creditcard.csv`; also the Kafka message key |
 | Time | DOUBLE PRECISION | Seconds since first transaction (0–172,792) |
 | V1 – V28 | DOUBLE PRECISION | PCA-transformed features (masked for privacy) |
 | Amount | DOUBLE PRECISION | Transaction amount (raw currency units) |
 | Class | INTEGER | Ground truth: 0 = legitimate, 1 = fraud |
 
-### `fraud_alerts`
+### `scored_transactions`
 
 | Column | Type | Description |
 |---|---|---|
-| id | SERIAL | Primary key |
-| batch_start_sec | DOUBLE PRECISION | Start of the dataset time window |
-| batch_end_sec | DOUBLE PRECISION | End of the dataset time window |
-| Time | DOUBLE PRECISION | Transaction time within the dataset |
-| Amount | DOUBLE PRECISION | Transaction amount |
-| rule_score | DOUBLE PRECISION | Rule engine score [0, 1] |
-| if_score | DOUBLE PRECISION | Isolation Forest score [0, 1] |
-| combined_score | DOUBLE PRECISION | Weighted combined score [0, 1] |
-| is_confirmed_fraud | BOOLEAN | True if Class == 1 |
-| flagged_at | TIMESTAMPTZ | Wall-clock time when the alert was written |
+| txn_id | BIGINT (PK) | Scored transaction (idempotency key) |
+| event_time_sec | DOUBLE PRECISION | Dataset `Time` of the event |
+| amount | DOUBLE PRECISION | Transaction amount |
+| rule_score / if_score / combined_score | DOUBLE PRECISION | Scores in [0, 1] |
+| is_high_risk | BOOLEAN | `combined_score ≥ threshold` |
+| threshold | DOUBLE PRECISION | Threshold of the model that scored it |
+| model_version | TEXT | Training timestamp of that model |
+| split | TEXT | `fit` / `tune` / `test` window of that model |
+| produced_at / scored_at | TIMESTAMPTZ | Producer send time / score time |
+| latency_ms | DOUBLE PRECISION | `scored_at − produced_at` |
+
+### `model_metrics`
+
+One row per window (`fit`, `tune`, `test`) per promoted model: `n_rows`, `fraud_rows`, `roc_auc`, `pr_auc`, `alert_precision`, `recall`, `f1`, `threshold`, `model_version`, `recorded_at`.
 
 ### Views
 
-**`fraud_alerts_enriched`** — Adds `dataset_hour` to every `fraud_alerts` row. Used by the Alert Volume by Dataset Hour panel.
-
-**`hourly_transaction_summary`** — Aggregates `transactions` by one-hour buckets: total count, confirmed fraud count, and fraud rate percentage. Used by the Live Fraud Rate panel.
+- **`fraud_alerts`**: high-risk rows from `scored_transactions`, joined with `transactions."Class"` as `is_confirmed_fraud`. This plays the role of a chargeback feed arriving after scoring.
+- **`hourly_transaction_summary`**: transactions and fraud rate per dataset hour.
 
 ---
 
@@ -455,38 +430,31 @@ Transactions are sorted by `Time` and split into three consecutive windows. Noth
 | Stop everything | `docker compose down` |
 | Ingest & clean | `python src/ingest_and_clean.py [--if-empty]` |
 | Train model | `python src/train_detector.py [--csv data/creditcard.csv] [--if-missing]` |
-| Test ETL (no Airflow) | `python src/test_etl_run.py` |
-| Populate all windows | `python scripts/populate_alerts.py` |
+| Run consumer | `python -m src.streaming.consumer` |
+| Run producer | `python -m src.streaming.producer [--speedup N] [--start-time SEC] [--limit N]` |
+| Trigger retraining | `docker compose exec airflow airflow dags trigger fraud_model_retraining` |
 | DVC pull data | `dvc pull` |
 
 ---
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'psycopg2'`** (host scripts)
-Install the pinned requirements in the Python environment you are actually running:
-```bash
-pip install -r requirements.txt
-```
+**Grafana panels say "No data"**
+- Check the consumer is scoring: `docker compose logs --tail 20 consumer`
+- Check the producer has not finished: `docker compose ps producer`. To replay again, run `docker compose up -d producer`. Already-scored transactions are skipped, so wipe `scored_transactions` first if you want the charts to restart.
+- Time-series panels show the last 15 minutes of wall-clock time; widen the range after a replay ends.
 
-**`cannot drop table fraud_alerts because other objects depend on it`**
-The `fraud_alerts_enriched` view depends on the table. Drop with cascade:
-```sql
-DROP TABLE fraud_alerts CASCADE;
-```
-Then re-run `python src/ingest_and_clean.py --if-empty`, which re-applies `scripts/schema.sql`.
-
-**Grafana shows "No data" on all panels**
-- Confirm the `fraud_alerts` table has rows: `SELECT COUNT(*) FROM fraud_alerts;`
-- If empty, run `python scripts/populate_alerts.py`
-- Check the Grafana time range — set it to "Last 48 hours" or "Last 7 days"
-- Confirm the datasource can connect: Connections → Data Sources → FraudDB → Test
+**Consumer waits for the model**
+- The consumer starts after `bootstrap` finishes; check `docker compose logs bootstrap`.
 
 **Airflow DAG not appearing**
 - Check for parse errors: `docker compose exec airflow airflow dags list-import-errors`
 
 **Port already in use**
-- Grafana (3001), Airflow (8080) and Postgres (5433) are published on the host. Stop whatever holds the port, or change the left-hand side of the `ports:` mapping in `docker-compose.yml` (Postgres: set `POSTGRES_HOST_PORT` in `.env`).
+- Grafana (3001), Airflow (8080), Postgres (5433) and Kafka (29092) are published on the host. Stop whatever holds the port, or change the left-hand side of the `ports:` mapping in `docker-compose.yml` (Postgres: set `POSTGRES_HOST_PORT` in `.env`).
+
+**`ModuleNotFoundError` when running scripts on the host**
+- Install the pinned requirements in the Python environment you are actually using: `pip install -r requirements.txt`
 
 **DVC pull fails on a new machine**
 Configure the remote to point to wherever `dvc-storage` was placed:
