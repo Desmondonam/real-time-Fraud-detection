@@ -136,7 +136,9 @@ services:
       MODEL_PATH: /opt/models/fraud_scorer.pkl
     volumes:
       - ./airflow/dags:/opt/airflow/dags
-      - ./airflow/logs:/opt/airflow/logs
+      # Named volume, not a bind mount: on Linux a bind-mounted dir is created
+      # root-owned and the airflow user (uid 50000) cannot write to it.
+      - airflow_logs:/opt/airflow/logs
       # The DAG resolves its project root two levels up from /opt/airflow/dags = /opt
       - ./src:/opt/src
       - ./scripts:/opt/scripts
@@ -180,4 +182,5 @@ services:
 volumes:
   pg_data:
   models:
+  airflow_logs:
   grafana_data:
