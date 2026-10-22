@@ -11,17 +11,8 @@ An end-to-end fraud detection pipeline that ingests credit card transaction data
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
-- [Setup Guide](#setup-guide)
-  - [1. Clone the repository](#1-clone-the-repository)
-  - [2. Configure environment variables](#2-configure-environment-variables)
-  - [3. Install Python dependencies](#3-install-python-dependencies)
-  - [4. Set up PostgreSQL databases](#4-set-up-postgresql-databases)
-  - [5. Pull data with DVC](#5-pull-data-with-dvc)
-  - [6. Ingest and clean the data](#6-ingest-and-clean-the-data)
-  - [7. Train the detection model](#7-train-the-detection-model)
-  - [8. Populate fraud alerts](#8-populate-fraud-alerts)
-  - [9. Start the Grafana dashboard](#9-start-the-grafana-dashboard)
-  - [10. Configure and run Airflow](#10-configure-and-run-airflow)
+- [Quick Start (Docker Compose)](#quick-start-docker-compose)
+- [Running Scripts Locally](#running-scripts-locally)
 - [How the System Works](#how-the-system-works)
   - [Stage 1 — Data Ingestion and Cleaning](#stage-1--data-ingestion-and-cleaning)
   - [Stage 2 — Detection Logic](#stage-2--detection-logic)
@@ -73,7 +64,7 @@ Raw CSV (144 MB)
         ▼                  ▼
 ┌───────────────┐   ┌──────────────────────────────┐
 │  Airflow DAG  │   │        Grafana Dashboard       │
-│  (hourly)     │   │   localhost:3000               │
+│  (hourly)     │   │   localhost:3001               │
 │               │   │                                │
 │  1h window    │   │  • Hourly alert volume         │
 │  → score      │   │  • Live fraud rate             │
@@ -109,11 +100,12 @@ Raw CSV (144 MB)
 | Layer | Technology |
 |---|---|
 | Language | Python 3.12 |
-| Database | PostgreSQL 17 |
+| Database | PostgreSQL 16 (Docker) |
 | Data versioning | DVC 3.60 |
 | ML / Scoring | scikit-learn (IsolationForest, MinMaxScaler) |
 | Orchestration | Apache Airflow 2.10 |
-| Dashboard | Grafana OSS 11.4 (Docker) |
+| Dashboard | Grafana OSS 11.4 |
+| Runtime | Docker Compose (Postgres, Airflow, Grafana, bootstrap job) |
 | DB access | SQLAlchemy 2.0 + psycopg2 |
 | Data wrangling | pandas 2.x |
 | Model persistence | joblib |
@@ -126,46 +118,47 @@ Raw CSV (144 MB)
 ```
 real-time-Fraud-detection/
 │
+├── docker-compose.yml           # Whole stack: Postgres, bootstrap, Airflow, Grafana
+├── Dockerfile                   # App image (bootstrap job)
+├── requirements.txt             # Pinned runtime dependencies
+├── .env.example                 # Credentials template (copy to .env)
+│
 ├── data/
 │   ├── creditcard.csv.dvc       # DVC pointer — actual file managed by DVC
 │   └── .gitignore
 │
 ├── src/
-│   ├── ingest_and_clean.py      # Stage 1: load CSV → PostgreSQL
-│   ├── train_detector.py        # Train Isolation Forest + evaluate
-│   ├── test_etl_run.py          # Run ETL logic without Airflow (dev/test)
+│   ├── ingest_and_clean.py      # Stage 1: load CSV → PostgreSQL (COPY)
+│   ├── train_detector.py        # Time-split training + held-out evaluation
+│   ├── test_etl_run.py          # Run ETL logic without Airflow (dev)
 │   └── detection/
 │       ├── __init__.py
-│       ├── rule_engine.py       # Rule-based scorer
-│       ├── isolation_forest.py  # IF training, save, load, inference
-│       └── scorer.py            # CombinedScorer (rule + IF)
+│       ├── rule_engine.py       # Rule-based scorer (rules learned on train window)
+│       ├── isolation_forest.py  # IF training + inference
+│       └── scorer.py            # CombinedScorer (rule + IF), model bundle I/O
 │
 ├── airflow/
-│   ├── dags/
-│   │   └── fraud_etl_dag.py    # Hourly Airflow DAG
-│   ├── airflow.env.example      # Environment variable template
-│   └── airflow.env              # Your local config (gitignored)
+│   └── dags/
+│       └── fraud_etl_dag.py     # Hourly Airflow DAG
+│
+├── docker/
+│   ├── airflow/Dockerfile       # Airflow image + scikit-learn
+│   └── postgres/01-create-databases.sql
 │
 ├── grafana/
-│   ├── docker-compose.yml
 │   └── provisioning/
 │       ├── datasources/
-│       │   ├── fraud_db.yaml          # Active datasource (gitignored)
-│       │   └── fraud_db.yaml.example  # Template
+│       │   └── fraud_db.yaml          # Reads credentials from the container env
 │       └── dashboards/
 │           ├── dashboard.yaml
 │           └── fraud_detection.json   # Auto-provisioned dashboard
 │
 ├── scripts/
-│   ├── create_views.sql         # Creates fraud_alerts_enriched + hourly views
+│   ├── schema.sql               # Tables + dashboard views (idempotent)
 │   └── populate_alerts.py       # Backfills all 48 batch windows
 │
-├── models/
-│   └── fraud_scorer.pkl         # Trained model bundle (gitignored)
-│
+├── models/                      # Model bundle when training locally (gitignored)
 ├── .dvc/                        # DVC configuration
-├── .env                         # DB credentials (gitignored)
-├── .gitignore
 └── README.md
 ```
 
@@ -175,108 +168,62 @@ real-time-Fraud-detection/
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Python | 3.12 | Anaconda recommended |
-| PostgreSQL | 17 | Must be running locally |
-| Docker Desktop | Any recent | For Grafana |
-| DVC | 3.60+ | `pip install dvc` |
-| Git | Any | |
+| Docker Desktop / Docker Engine | Compose v2 | Runs the whole stack |
+| DVC | 3.60+ | `pip install dvc` — to fetch `data/creditcard.csv` |
+| Python | 3.12 | Only needed to run scripts or tests outside Docker |
 
 ---
 
-## Setup Guide
-
-### 1. Clone the repository
+## Quick Start (Docker Compose)
 
 ```bash
 git clone https://github.com/Desmondonam/real-time-Fraud-detection.git
 cd real-time-Fraud-detection
+
+dvc pull                 # fetch data/creditcard.csv (see "DVC pull fails" below)
+cp .env.example .env     # optional — set your own DB password
+docker compose up -d --build
 ```
 
-### 2. Configure environment variables
+What happens:
 
-Copy the template and fill in your credentials:
+1. **postgres** starts and creates the `fraud_detection` and `airflow_metadata` databases.
+2. **bootstrap** (one-shot) applies `scripts/schema.sql`, loads the CSV with `COPY`, then trains the model with the time-based split and prints the held-out metrics. Both steps are skipped if their output already exists, so later `up`s are fast. Follow it with `docker compose logs -f bootstrap`.
+3. **airflow** starts once bootstrap has finished, and **grafana** starts as soon as Postgres is healthy.
+
+| Service | URL | Login |
+|---|---|---|
+| Grafana | [http://localhost:3001](http://localhost:3001) | admin / admin |
+| Airflow | [http://localhost:8080](http://localhost:8080) | admin / admin |
+| Postgres | `localhost:5433` | values from `.env` (default postgres / postgres) |
+
+Postgres is published on **5433** so it does not clash with a local install on 5432 (override with `POSTGRES_HOST_PORT`).
+
+Useful commands:
 
 ```bash
-cp .env.example .env   # or create .env manually
+docker compose logs -f bootstrap        # ingest + training output
+docker compose down                     # stop (data and model are kept in volumes)
+docker compose down -v                  # stop and wipe Postgres, model and Grafana volumes
+docker compose run --rm bootstrap python src/train_detector.py   # force a retrain
 ```
 
-`.env` contents:
+---
 
-```env
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=fraud_detection
-DB_USER=postgres
-DB_PASSWORD=your_postgres_password
-```
+## Running Scripts Locally
 
-### 3. Install Python dependencies
+Everything can also be run from the host against the compose Postgres (`DB_HOST=localhost`, `DB_PORT=5433` in `.env`):
 
 ```bash
-pip install pandas sqlalchemy psycopg2-binary scikit-learn \
-            joblib python-dotenv apache-airflow[postgres]==2.10.4
+pip install -r requirements.txt
+python src/ingest_and_clean.py                          # schema + COPY load
+python src/train_detector.py                            # or: --csv data/creditcard.csv
+python scripts/populate_alerts.py                       # backfill all 48 windows
 ```
 
-> If using Anaconda, ensure all packages install into the same environment that you will use to run scripts.
-
-### 4. Set up PostgreSQL databases
-
-The system needs two databases — one for application data and one for Airflow metadata:
-
-```bash
-psql -U postgres -c "CREATE DATABASE fraud_detection;"
-psql -U postgres -c "CREATE DATABASE airflow_metadata;"
-```
-
-Then create the dashboard views:
-
-```bash
-psql -U postgres -d fraud_detection -f scripts/create_views.sql
-```
-
-### 5. Pull data with DVC
-
-The raw CSV is tracked by DVC, not git. Pull it from the configured local remote:
-
-```bash
-dvc pull
-```
-
-If you are setting up on a new machine, first configure the DVC remote to point to wherever the data is stored:
-
-```bash
-dvc remote modify local_storage url /path/to/your/dvc-storage
-dvc pull
-```
-
-### 6. Ingest and clean the data
-
-This script validates the schema, handles any null values, and bulk-loads all 284,807 rows into PostgreSQL:
-
-```bash
-python src/ingest_and_clean.py
-```
-
-Expected output:
-
-```
-[INFO] Raw shape: (284807, 31)
-[INFO] Schema validation passed — 31 columns, 284807 rows
-[INFO] No null values found
-[INFO] Loaded 284807 rows into table 'transactions'
-[INFO] Verification — total rows: 284807 | fraud rows: 492 (0.173%)
-```
-
-### 7. Train the detection model
+### Train the detection model
 
 Sorts transactions by `Time`, fits the rule thresholds and Isolation Forest on the first 60%, tunes the decision threshold on the next 20%, and reports metrics on the final 20% (see [Model Performance](#model-performance)):
-
-```bash
-python src/train_detector.py                            # reads PostgreSQL
-python src/train_detector.py --csv data/creditcard.csv  # or straight from the CSV
-```
-
-Expected output:
 
 ```
 ================================================================
@@ -288,92 +235,7 @@ Expected output:
   test     56,962     75   0.9605  0.1756  0.231  0.453  0.306
 ```
 
-The model bundle (IF model, learned rules, tuned threshold, split cut-offs and metrics) is saved to `models/fraud_scorer.pkl`, and the metrics are also written to `models/metrics.json`.
-
-### 8. Populate fraud alerts
-
-Runs the full ETL scoring logic across all 48 one-hour windows and writes results to the `fraud_alerts` table. This gives the Grafana dashboard enough data to display meaningful charts:
-
-```bash
-python scripts/populate_alerts.py
-```
-
-Expected output:
-
-```
-[INFO] fraud_alerts reset
-[INFO] Window 00/48 → 18 alerts
-[INFO] Window 01/48 → 9 alerts
-...
-[INFO] Done — 1809 total alerts across 48 windows | 492 confirmed fraud
-```
-
-### 9. Start the Grafana dashboard
-
-Before starting Grafana, copy the datasource template and fill in your credentials:
-
-```bash
-cp grafana/provisioning/datasources/fraud_db.yaml.example \
-   grafana/provisioning/datasources/fraud_db.yaml
-# Edit fraud_db.yaml and set your DB_USER and DB_PASSWORD
-```
-
-Then start the container:
-
-```bash
-cd grafana
-docker compose up -d
-```
-
-Open **[http://localhost:3000](http://localhost:3000)** in your browser.
-
-- Username: `admin`
-- Password: `admin`
-
-The **Fraud Detection Dashboard** will appear automatically on the home screen. No manual configuration needed.
-
-To stop Grafana:
-
-```bash
-docker compose down
-```
-
-### 10. Configure and run Airflow
-
-Copy and edit the Airflow environment file:
-
-```bash
-cp airflow/airflow.env.example airflow/airflow.env
-# Edit airflow.env — set AIRFLOW_HOME to the absolute path of the airflow/ folder
-# and set the DB connection string with your postgres password
-```
-
-Initialise the Airflow metadata database (first time only):
-
-```bash
-set -a && source airflow/airflow.env && set +a
-airflow db migrate
-airflow users create \
-    --username admin --password admin \
-    --firstname Admin --lastname User \
-    --role Admin --email admin@example.com
-```
-
-Start the scheduler and web UI:
-
-```bash
-# Terminal 1 — scheduler
-set -a && source airflow/airflow.env && set +a
-airflow scheduler
-
-# Terminal 2 — web UI
-set -a && source airflow/airflow.env && set +a
-airflow webserver -p 8080
-```
-
-Open **[http://localhost:8080](http://localhost:8080)** (admin / admin), find the `fraud_etl_pipeline` DAG, and toggle it on. It will run automatically every hour.
-
-> **Windows note:** Airflow runs on Windows with the `SequentialExecutor` (configured by default). For production, use Linux or WSL2 with the `CeleryExecutor`.
+The model bundle (IF model, learned rules, tuned threshold, split cut-offs and metrics) is saved to `models/fraud_scorer.pkl`, and the metrics are also written to `models/metrics.json`. Inside Docker it lives in the `models` volume instead, so containers and host never mix scikit-learn versions.
 
 ---
 
@@ -494,11 +356,11 @@ fetch_and_score_batch   ← determines window, loads V1–V28 + Amount + Time,
 
 ### Stage 4 — Dashboard (Grafana)
 
-**URL:** [http://localhost:3000](http://localhost:3000) — admin / admin  
+**URL:** [http://localhost:3001](http://localhost:3001) — admin / admin  
 **Refresh:** Every 30 seconds  
 **Time range:** Last 48 hours (covers the full dataset window)
 
-The dashboard is fully provisioned from `grafana/provisioning/` — no manual setup required after `docker compose up`.
+The dashboard and its datasource are fully provisioned from `grafana/provisioning/` — no manual setup required after `docker compose up`.
 
 #### Panels
 
@@ -587,26 +449,24 @@ Transactions are sorted by `Time` and split into three consecutive windows. Noth
 
 ## Script Reference
 
-| Script | Command | Description |
-|---|---|---|
-| Ingest & clean | `python src/ingest_and_clean.py` | Load CSV into PostgreSQL |
-| Train model | `python src/train_detector.py` | Train IF, save model, print metrics |
-| Test ETL (no Airflow) | `python src/test_etl_run.py` | Run 3 batch windows locally |
-| Populate all windows | `python scripts/populate_alerts.py` | Backfill all 48 hours of alerts |
-| Create DB views | `psql -d fraud_detection -f scripts/create_views.sql` | (Re)create Grafana views |
-| Start dashboard | `cd grafana && docker compose up -d` | Launch Grafana on port 3000 |
-| Stop dashboard | `cd grafana && docker compose down` | Stop Grafana container |
-| DVC pull data | `dvc pull` | Download creditcard.csv from remote |
-| DVC push data | `dvc push` | Upload creditcard.csv to remote |
+| Task | Command |
+|---|---|
+| Start everything | `docker compose up -d --build` |
+| Stop everything | `docker compose down` |
+| Ingest & clean | `python src/ingest_and_clean.py [--if-empty]` |
+| Train model | `python src/train_detector.py [--csv data/creditcard.csv] [--if-missing]` |
+| Test ETL (no Airflow) | `python src/test_etl_run.py` |
+| Populate all windows | `python scripts/populate_alerts.py` |
+| DVC pull data | `dvc pull` |
 
 ---
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'psycopg2'`**
-Install psycopg2 in the Python environment you are actually running:
+**`ModuleNotFoundError: No module named 'psycopg2'`** (host scripts)
+Install the pinned requirements in the Python environment you are actually running:
 ```bash
-pip install psycopg2-binary
+pip install -r requirements.txt
 ```
 
 **`cannot drop table fraud_alerts because other objects depend on it`**
@@ -614,7 +474,7 @@ The `fraud_alerts_enriched` view depends on the table. Drop with cascade:
 ```sql
 DROP TABLE fraud_alerts CASCADE;
 ```
-Then re-run `scripts/create_views.sql` to recreate the views.
+Then re-run `python src/ingest_and_clean.py --if-empty`, which re-applies `scripts/schema.sql`.
 
 **Grafana shows "No data" on all panels**
 - Confirm the `fraud_alerts` table has rows: `SELECT COUNT(*) FROM fraud_alerts;`
@@ -623,8 +483,10 @@ Then re-run `scripts/create_views.sql` to recreate the views.
 - Confirm the datasource can connect: Connections → Data Sources → FraudDB → Test
 
 **Airflow DAG not appearing**
-- Verify `AIRFLOW__CORE__DAGS_FOLDER` in your `airflow.env` points to the absolute path of `airflow/dags/`
-- Check for parse errors: `airflow dags list`
+- Check for parse errors: `docker compose exec airflow airflow dags list-import-errors`
+
+**Port already in use**
+- Grafana (3001), Airflow (8080) and Postgres (5433) are published on the host. Stop whatever holds the port, or change the left-hand side of the `ports:` mapping in `docker-compose.yml` (Postgres: set `POSTGRES_HOST_PORT` in `.env`).
 
 **DVC pull fails on a new machine**
 Configure the remote to point to wherever `dvc-storage` was placed:

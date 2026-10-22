@@ -1,0 +1,116 @@
+# One command for the whole stack:
+#
+#   docker compose up -d --build
+#
+# Postgres → bootstrap (ingest CSV + train model, skipped when already done)
+#          → Airflow (http://localhost:8080) and Grafana (http://localhost:3001)
+#
+# Credentials come from .env (see .env.example); the defaults below are for local use only.
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: ${DB_NAME:-fraud_detection}
+  DB_USER: ${DB_USER:-postgres}
+  DB_PASSWORD: ${DB_PASSWORD:-postgres}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fraud_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-fraud_detection}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/postgres/01-create-databases.sql:/docker-entrypoint-initdb.d/01-create-databases.sql:ro
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot: load the CSV and train the model. Both steps are skipped when
+  # their output already exists, so restarts are fast.
+  bootstrap:
+    build: .
+    container_name: fraud_bootstrap
+    command: >
+      sh -c "python src/ingest_and_clean.py --if-empty &&
+             python src/train_detector.py --if-missing"
+    environment:
+      <<: *db-env
+      MODEL_PATH: /app/models/fraud_scorer.pkl
+    volumes:
+      - ./data:/app/data:ro
+      - models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow:
+    build: ./docker/airflow
+    container_name: fraud_airflow
+    command: standalone
+    environment:
+      <<: *db-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/airflow_metadata
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      MODEL_PATH: /opt/models/fraud_scorer.pkl
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      # The DAG resolves its project root two levels up from /opt/airflow/dags = /opt
+      - ./src:/opt/src
+      - ./scripts:/opt/scripts
+      - models:/opt/models
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    container_name: fraud_grafana
+    environment:
+      DB_NAME: ${DB_NAME:-fraud_detection}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/fraud_detection.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  models:
+  grafana_data:

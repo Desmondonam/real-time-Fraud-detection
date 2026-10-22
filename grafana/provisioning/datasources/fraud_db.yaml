@@ -1,20 +1,22 @@
 apiVersion: 1
 
+# Credentials are injected from the container environment (see docker-compose.yml),
+# so this file can be committed as-is.
 datasources:
   - name: FraudDB
     type: postgres
     uid: fraud_postgres
-    url: host.docker.internal:5432
-    database: fraud_detection
-    user: <db_user>
+    url: postgres:5432
+    user: ${DB_USER}
     secureJsonData:
-      password: <db_password>
+      password: ${DB_PASSWORD}
     jsonData:
+      database: ${DB_NAME}
       sslmode: disable
       maxOpenConns: 5
       maxIdleConns: 2
       connMaxLifetime: 14400
-      postgresVersion: 1700
+      postgresVersion: 1600
       timescaledb: false
     isDefault: true
     editable: false

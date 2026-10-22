@@ -2,11 +2,20 @@
 Ingest creditcard.csv into PostgreSQL.
 Steps: schema validation → null handling → load.
 
+The table and dashboard views are created from scripts/schema.sql, then the
+rows are bulk-loaded with COPY.
+
+Run:
+    python src/ingest_and_clean.py
+    python src/ingest_and_clean.py --if-empty   # no-op if already loaded
+
 Amount is stored in raw currency units. It used to be Z-scored here with a
 scaler fitted on the full dataset, which leaked test-period statistics into
 training; the rule engine now standardises it with training-window stats.
 """
 
+import argparse
+import io
 import logging
 import os
 import sys
@@ -35,6 +44,7 @@ EXPECTED_DTYPES = {col: float for col in EXPECTED_COLUMNS}
 EXPECTED_DTYPES["Class"] = int
 
 CSV_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "creditcard.csv")
+SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "..", "scripts", "schema.sql")
 TABLE_NAME = "transactions"
 
 
@@ -108,18 +118,33 @@ def handle_nulls(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_to_postgres(df: pd.DataFrame, engine) -> None:
+def apply_schema(engine) -> None:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
+        ddl = f.read()
     with engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {TABLE_NAME}"))
+        conn.exec_driver_sql(ddl)
+    log.info("Schema applied from %s", SCHEMA_PATH)
 
-    df.to_sql(
-        TABLE_NAME,
-        engine,
-        if_exists="replace",
-        index=False,
-        chunksize=5_000,
-        method="multi",
-    )
+
+def row_count(engine) -> int:
+    with engine.connect() as conn:
+        return conn.execute(text(f"SELECT COUNT(*) FROM {TABLE_NAME}")).scalar()
+
+
+def load_to_postgres(df: pd.DataFrame, engine) -> None:
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, header=False)
+    buf.seek(0)
+    columns = ", ".join(f'"{c}"' for c in EXPECTED_COLUMNS)
+
+    raw = engine.raw_connection()
+    try:
+        with raw.cursor() as cur:
+            cur.execute(f"TRUNCATE {TABLE_NAME}")
+            cur.copy_expert(f"COPY {TABLE_NAME} ({columns}) FROM STDIN WITH CSV", buf)
+        raw.commit()
+    finally:
+        raw.close()
     log.info("Loaded %d rows into table '%s'", len(df), TABLE_NAME)
 
 
@@ -142,8 +167,22 @@ def verify_load(engine) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Loading CSV from %s", CSV_PATH)
-    df = pd.read_csv(CSV_PATH)
+    parser = argparse.ArgumentParser(description="Load creditcard.csv into PostgreSQL")
+    parser.add_argument("--csv", default=CSV_PATH)
+    parser.add_argument("--if-empty", action="store_true",
+                        help="skip loading when the transactions table already has rows")
+    args = parser.parse_args()
+
+    log.info("Connecting to PostgreSQL …")
+    engine = get_engine()
+    apply_schema(engine)
+
+    if args.if_empty and row_count(engine) > 0:
+        log.info("Table '%s' already populated — skipping load", TABLE_NAME)
+        return 0
+
+    log.info("Loading CSV from %s", args.csv)
+    df = pd.read_csv(args.csv)
     log.info("Raw shape: %s", df.shape)
 
     validate_schema(df)
@@ -152,12 +191,10 @@ def main():
 
     df["Class"] = df["Class"].astype(int)
 
-    log.info("Connecting to PostgreSQL …")
-    engine = get_engine()
-
     load_to_postgres(df, engine)
     verify_load(engine)
     log.info("Done.")
+    return 0
 
 
 if __name__ == "__main__":
