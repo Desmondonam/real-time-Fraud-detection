@@ -40,7 +40,7 @@ This system simulates a production fraud detection pipeline on the [Kaggle Credi
 
 It:
 
-1. **Ingests** the raw CSV into PostgreSQL, validating schema, handling nulls, and Z-score normalising the `Amount` column.
+1. **Ingests** the raw CSV into PostgreSQL, validating schema and handling nulls.
 2. **Scores** every transaction using two complementary methods — a transparent rule engine and an unsupervised Isolation Forest — combined into a single risk score.
 3. **Simulates streaming** via an Airflow DAG that processes the dataset in one-hour time windows on an hourly schedule, writing high-risk transactions to a `fraud_alerts` table.
 4. **Visualises** live alert volume, fraud rate, and flagged transaction categories in Grafana, auto-refreshing every 30 seconds.
@@ -55,8 +55,8 @@ Raw CSV (144 MB)
       │  DVC track + local remote
       ▼
 ┌─────────────────────────────┐
-│  src/ingest_and_clean.py    │  Schema validation, null handling,
-│                             │  Amount Z-score normalisation
+│  src/ingest_and_clean.py    │  Schema validation, null handling
+│                             │
 └────────────┬────────────────┘
              │  284,807 rows
              ▼
@@ -88,17 +88,17 @@ Raw CSV (144 MB)
 │    Amount > 2σ / 3σ           +score │
 │    Night hours (00-05)        ×1.5   │
 │    Business hours (09-17)     ×0.75  │
-│    PCA features V14/V17/     +score  │
-│      V12/V10/V3/V4                   │
+│    6 PCA rules learned on     +score │
+│      the training window             │
 │                                      │
 │  isolation_forest.py                 │
 │    30 features (V1-V28,              │
 │    Amount, time_hour)                │
-│    contamination = 0.00173           │
+│    contamination = "auto"            │
 │                                      │
 │  scorer.py  (CombinedScorer)         │
 │    combined = 0.4×rule + 0.6×IF      │
-│    flag if combined ≥ 0.40           │
+│    flag if combined ≥ tuned thresh.  │
 └──────────────────────────────────────┘
 ```
 
@@ -111,7 +111,7 @@ Raw CSV (144 MB)
 | Language | Python 3.12 |
 | Database | PostgreSQL 17 |
 | Data versioning | DVC 3.60 |
-| ML / Scoring | scikit-learn (IsolationForest, StandardScaler, MinMaxScaler) |
+| ML / Scoring | scikit-learn (IsolationForest, MinMaxScaler) |
 | Orchestration | Apache Airflow 2.10 |
 | Dashboard | Grafana OSS 11.4 (Docker) |
 | DB access | SQLAlchemy 2.0 + psycopg2 |
@@ -161,7 +161,7 @@ real-time-Fraud-detection/
 │   └── populate_alerts.py       # Backfills all 48 batch windows
 │
 ├── models/
-│   └── isolation_forest.pkl     # Trained IF model (gitignored)
+│   └── fraud_scorer.pkl         # Trained model bundle (gitignored)
 │
 ├── .dvc/                        # DVC configuration
 ├── .env                         # DB credentials (gitignored)
@@ -251,7 +251,7 @@ dvc pull
 
 ### 6. Ingest and clean the data
 
-This script validates the schema, handles any null values, Z-score normalises `Amount`, and bulk-loads all 284,807 rows into PostgreSQL:
+This script validates the schema, handles any null values, and bulk-loads all 284,807 rows into PostgreSQL:
 
 ```bash
 python src/ingest_and_clean.py
@@ -263,40 +263,32 @@ Expected output:
 [INFO] Raw shape: (284807, 31)
 [INFO] Schema validation passed — 31 columns, 284807 rows
 [INFO] No null values found
-[INFO] Amount normalized — mean=0.0000, std=1.0000
 [INFO] Loaded 284807 rows into table 'transactions'
 [INFO] Verification — total rows: 284807 | fraud rows: 492 (0.173%)
 ```
 
 ### 7. Train the detection model
 
-Trains an Isolation Forest on all 284,807 transactions (unsupervised — the `Class` label is held out during training) and evaluates detection performance:
+Sorts transactions by `Time`, fits the rule thresholds and Isolation Forest on the first 60%, tunes the decision threshold on the next 20%, and reports metrics on the final 20% (see [Model Performance](#model-performance)):
 
 ```bash
-python src/train_detector.py
+python src/train_detector.py                            # reads PostgreSQL
+python src/train_detector.py --csv data/creditcard.csv  # or straight from the CSV
 ```
 
 Expected output:
 
 ```
-[INFO] Training IsolationForest on 284807 samples, 30 features …
-[INFO] Training complete.
-
-============================================================
-  DETECTION EVALUATION (threshold = 0.40)
-============================================================
-  ROC-AUC              : 0.9511
-  Confusion matrix
-    True Negatives     :  282,998
-    False Positives    :    1,317
-    False Negatives    :      182
-    True Positives     :      310
-
-  Best F1 threshold    : 0.5503  | precision=0.5592  recall=0.4126  F1=0.4749
-============================================================
+================================================================
+  DETECTION EVALUATION  (threshold = 0.4908, tuned on 'tune')
+================================================================
+  window     rows  fraud  ROC-AUC  PR-AUC   prec recall     F1
+  fit     170,884    360   0.9558  0.5640  0.371  0.689  0.482
+  tune     56,961     57   0.9421  0.0728  0.136  0.386  0.201
+  test     56,962     75   0.9605  0.1756  0.231  0.453  0.306
 ```
 
-The trained model is saved to `models/isolation_forest.pkl`.
+The model bundle (IF model, learned rules, tuned threshold, split cut-offs and metrics) is saved to `models/fraud_scorer.pkl`, and the metrics are also written to `models/metrics.json`.
 
 ### 8. Populate fraud alerts
 
@@ -391,15 +383,13 @@ Open **[http://localhost:8080](http://localhost:8080)** (admin / admin), find th
 
 **Script:** `src/ingest_and_clean.py`
 
-The raw `creditcard.csv` (284,807 rows × 31 columns) goes through four steps before it reaches PostgreSQL:
+The raw `creditcard.csv` (284,807 rows × 31 columns) goes through three steps before it reaches PostgreSQL:
 
 1. **Schema validation** — Checks that all 31 expected columns are present (`Time`, `V1`–`V28`, `Amount`, `Class`). Extra columns are dropped; missing columns raise an error.
 
 2. **Null handling** — Any null values in `V1`–`V28` or `Amount` are filled with that column's median. Rows with a null `Class` are dropped entirely (they cannot be labelled).
 
-3. **Amount normalisation** — The raw `Amount` column has a highly skewed distribution (transactions range from $0 to $25,691). A `StandardScaler` transforms it to mean = 0, std = 1. This makes it directly comparable with the PCA-transformed `V` features and prevents Amount from dominating the Isolation Forest.
-
-4. **Bulk load** — Data is inserted into the `transactions` table in 5,000-row chunks via SQLAlchemy.
+3. **Bulk load** — Data is inserted into the `transactions` table in 5,000-row chunks via SQLAlchemy.
 
 The `Time` column is left as-is (seconds since the first transaction, ranging 0–172,792, covering approximately 48 hours of data).
 
@@ -413,18 +403,17 @@ Every transaction receives three scores, then a combined flag.
 
 #### Rule Engine (`rule_engine.py`)
 
-A fast, interpretable scorer that applies domain-knowledge rules and returns a value in [0, 1].
+A fast, interpretable scorer that applies threshold rules and returns a value in [0, 1]. Its parameters are **learned from the training window only** (`RuleEngine.fit`):
 
 | Signal | Condition | Points |
 |---|---|---|
-| Amount spike | `|Amount| > 2σ` | +1.0 |
-| Extreme amount | `|Amount| > 3σ` | +0.5 extra |
-| V14 anomaly | `V14 < −5` | +1.5 |
-| V17 anomaly | `V17 < −5` | +1.0 |
-| V12 anomaly | `V12 < −4` | +0.75 |
-| V10 anomaly | `V10 < −4` | +0.5 |
-| V3 anomaly | `V3 < −3` | +0.5 |
-| V4 anomaly | `V4 > 4` | +0.25 |
+| Amount spike | `|Amount − μ| > 2σ` (μ, σ from training window) | +1.0 |
+| Extreme amount | `|Amount − μ| > 3σ` | +0.5 extra |
+| PCA rule 1–6 | value beyond the 1% tail of *legitimate* training rows | +1.5, +1.0, +0.75, +0.5, +0.5, +0.25 |
+
+The six PCA features are chosen by ranking V1–V28 on how far the fraud median sits from the legitimate median (in units of the legitimate IQR) on the training window. On the current split this picks V17, V14, V12, V10, V16 and V3, all in the "<" direction.
+
+> Earlier versions hard-coded `V14 < −5`, `V17 < −5`, `V12 < −4`, … from published EDA on the *whole* dataset. Those thresholds had already seen the test labels, so they were replaced by the fitted rules above.
 
 After summing points, a **time-of-day multiplier** is applied:
 
@@ -434,24 +423,22 @@ After summing points, a **time-of-day multiplier** is applied:
 | 09:00 – 17:59 (business) | ×0.75 | Normal activity expected |
 | All other hours | ×1.0 | Neutral |
 
-The total is divided by the theoretical maximum (9.0) to produce a normalised score in [0, 1].
-
-The V14, V17, V12, and V10 features are PCA components known from published analysis of this dataset to carry the strongest fraud signal. They are not interpretable individually (they are linear combinations of the original masked features), but their extreme values are reliable anomaly indicators.
+The total is divided by the theoretical maximum (all points × 1.5) to produce a normalised score in [0, 1].
 
 #### Isolation Forest (`isolation_forest.py`)
 
-An unsupervised anomaly detection model trained on all 284,807 transactions. Key parameters:
+An unsupervised anomaly detection model trained on the training window (first 60% of transactions by time). Key parameters:
 
 | Parameter | Value | Reason |
 |---|---|---|
 | `n_estimators` | 200 | More trees → more stable scores |
-| `contamination` | 0.00173 | Matches the known 0.173% fraud rate |
+| `contamination` | `"auto"` | Not set from the fraud rate (that would leak labels); the offset it controls is cancelled by the [0, 1] rescaling anyway |
 | `max_samples` | `'auto'` | Uses min(256, n_samples) sub-samples per tree |
 | Features | V1–V28 + Amount + `time_hour` | 30 features total |
 
 The `time_hour` feature is derived as `int((Time % 86400) / 3600)` — the hour of day (0–23), assuming the dataset starts at midnight.
 
-Training is **unsupervised**: the `Class` label is never shown to the model. The `decision_function()` output is inverted (more anomalous → higher raw score) and scaled to [0, 1] using `MinMaxScaler` fitted on the training set.
+The `Class` label is never shown to the model. The `decision_function()` output is inverted (more anomalous → higher raw score) and scaled to [0, 1] using `MinMaxScaler` fitted on the training window.
 
 #### Combined Scorer (`scorer.py`)
 
@@ -461,7 +448,7 @@ combined_score = 0.4 × rule_score + 0.6 × if_score
 
 The Isolation Forest receives higher weight because it captures multivariate anomaly patterns that single-feature threshold rules miss. The rule engine is kept as an interpretable fast-path: clear-cut violations (e.g. V14 < −5) are always reflected in the score even if the IF disagrees.
 
-A transaction is flagged **high-risk** when `combined_score ≥ 0.40`.
+A transaction is flagged **high-risk** when `combined_score ≥ threshold`, where the threshold is the best-F1 cut-off on the *tune* window (currently 0.4908).
 
 ---
 
@@ -545,27 +532,34 @@ Because the dataset is anonymised (no actual merchant names), transactions are b
 
 ## Model Performance
 
-Evaluated on the full dataset (284,807 transactions) using `Class` as ground truth. The model is trained **without** the `Class` label — these metrics reflect true out-of-sample detection performance.
+### Evaluation protocol
+
+Transactions are sorted by `Time` and split into three consecutive windows. Nothing learned or tuned ever sees rows from a later window:
+
+| Window | Share | Rows | Fraud | Used for |
+|---|---|---|---|---|
+| fit | first 60% | 170,884 | 360 | Isolation Forest, rule features + thresholds, Amount μ/σ |
+| tune | next 20% | 56,961 | 57 | Choosing the decision threshold (best F1) |
+| test | last 20% | 56,962 | 75 | Reported metrics, evaluated once |
+
+### Held-out test results (last 20% of the timeline)
 
 | Metric | Value |
 |---|---|
-| ROC-AUC | **0.9511** |
-| Recall (fraud caught) | 63.0% (310 / 492) |
-| Precision at threshold 0.40 | 19.1% |
-| False Positives | 1,317 (0.46% of legit transactions) |
-| False Negatives | 182 fraud cases missed |
-| Best F1 threshold | 0.55 → F1 = 0.475 |
+| ROC-AUC | 0.9605 |
+| PR-AUC (average precision) | 0.1756 |
+| Precision at tuned threshold (0.4908) | 23.1% (34 / 147 alerts) |
+| Recall | 45.3% (34 / 75 fraud cases) |
+| F1 | 0.306 |
+| False positives | 113 (0.20% of legitimate transactions) |
+| False negatives | 41 |
 
-**Score separation:**
+### Reading these numbers
 
-| Class | Mean combined_score | Std |
-|---|---|---|
-| Legitimate (0) | 0.083 | 0.065 |
-| Fraud (1) | 0.467 | 0.216 |
-
-A ROC-AUC of 0.95 for a fully unsupervised model on a highly imbalanced dataset (0.17% fraud) is strong performance. The relatively low precision at threshold 0.40 is expected — it is the cost of running unsupervised; adding a downstream supervised model or analyst review loop would improve it significantly.
-
----
+- **The ROC-AUC looks good, but PR-AUC tells you more here.** At a 0.13% fraud rate, ROC-AUC is dominated by the huge pool of easy negatives. PR-AUC of 0.18 means that, on average, fewer than one in five alerts is real fraud.
+- **The tune window is harder than the test window** (tune F1 0.20 vs test 0.31). With only 57 and 75 fraud cases, these numbers carry wide error bars: a handful of cases moves recall by several points.
+- **In-sample numbers are noticeably better** (fit-window F1 0.48). The previous version of this README reported in-sample figures (F1 0.475 from training and evaluating on all rows, with label-derived rules and contamination) as out-of-sample. They should not be compared with the table above.
+- Hyperparameters such as the rule tail quantile (1%), score weights (0.4 / 0.6) and the number of trees were fixed up front, not searched against the test window.
 
 ## Database Schema
 
@@ -575,7 +569,7 @@ A ROC-AUC of 0.95 for a fully unsupervised model on a highly imbalanced dataset 
 |---|---|---|
 | Time | DOUBLE PRECISION | Seconds since first transaction (0–172,792) |
 | V1 – V28 | DOUBLE PRECISION | PCA-transformed features (masked for privacy) |
-| Amount | DOUBLE PRECISION | Z-score normalised transaction amount |
+| Amount | DOUBLE PRECISION | Transaction amount (raw currency units) |
 | Class | INTEGER | Ground truth: 0 = legitimate, 1 = fraud |
 
 ### `fraud_alerts`
@@ -586,7 +580,7 @@ A ROC-AUC of 0.95 for a fully unsupervised model on a highly imbalanced dataset 
 | batch_start_sec | DOUBLE PRECISION | Start of the dataset time window |
 | batch_end_sec | DOUBLE PRECISION | End of the dataset time window |
 | Time | DOUBLE PRECISION | Transaction time within the dataset |
-| Amount | DOUBLE PRECISION | Normalised amount |
+| Amount | DOUBLE PRECISION | Transaction amount |
 | rule_score | DOUBLE PRECISION | Rule engine score [0, 1] |
 | if_score | DOUBLE PRECISION | Isolation Forest score [0, 1] |
 | combined_score | DOUBLE PRECISION | Weighted combined score [0, 1] |

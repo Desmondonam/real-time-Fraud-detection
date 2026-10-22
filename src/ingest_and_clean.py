@@ -1,6 +1,10 @@
 """
 Ingest creditcard.csv into PostgreSQL.
-Steps: schema validation → null handling → Amount normalization → load.
+Steps: schema validation → null handling → load.
+
+Amount is stored in raw currency units. It used to be Z-scored here with a
+scaler fitted on the full dataset, which leaked test-period statistics into
+training; the rule engine now standardises it with training-window stats.
 """
 
 import logging
@@ -9,7 +13,6 @@ import sys
 
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine, text
 
 load_dotenv()
@@ -105,17 +108,6 @@ def handle_nulls(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def normalize_amount(df: pd.DataFrame) -> pd.DataFrame:
-    scaler = StandardScaler()
-    df["Amount"] = scaler.fit_transform(df[["Amount"]])
-    log.info(
-        "Amount normalized — mean=%.4f, std=%.4f (should be ~0 and ~1)",
-        df["Amount"].mean(),
-        df["Amount"].std(),
-    )
-    return df
-
-
 def load_to_postgres(df: pd.DataFrame, engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(f"DROP TABLE IF EXISTS {TABLE_NAME}"))
@@ -157,7 +149,6 @@ def main():
     validate_schema(df)
     df = df[EXPECTED_COLUMNS]          # enforce column order after validation
     df = handle_nulls(df)
-    df = normalize_amount(df)
 
     df["Class"] = df["Class"].astype(int)
 

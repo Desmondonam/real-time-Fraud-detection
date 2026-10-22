@@ -43,7 +43,7 @@ BATCH_SIZE_SECS = 3_600
 DAG_START_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
 _ALL_FEATURES = [f"V{i}" for i in range(1, 29)]
-_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "isolation_forest.pkl")
+_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "fraud_scorer.pkl")
 
 # ── DB connection ─────────────────────────────────────────────────────────────
 

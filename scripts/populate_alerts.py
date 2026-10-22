@@ -22,7 +22,7 @@ from src.detection.scorer import CombinedScorer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "isolation_forest.pkl")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "fraud_scorer.pkl")
 ALL_FEATURES = [f"V{i}" for i in range(1, 29)]
 DATASET_HOURS = 48
 BATCH_SECS = 3_600
