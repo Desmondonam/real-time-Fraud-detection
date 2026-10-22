@@ -43,7 +43,7 @@ It:
 1. **Ingests** the raw CSV into PostgreSQL, validating schema and handling nulls.
 2. **Scores** every transaction using two complementary methods — a transparent rule engine and an unsupervised Isolation Forest — combined into a single risk score.
 3. **Simulates streaming** via an Airflow DAG that processes the dataset in one-hour time windows on an hourly schedule, writing high-risk transactions to a `fraud_alerts` table.
-4. **Visualises** live alert volume, fraud rate, and flagged transaction categories in Grafana, auto-refreshing every 30 seconds.
+4. **Visualises** live alert volume and fraud rate in Grafana, auto-refreshing every 30 seconds.
 
 ---
 
@@ -77,7 +77,7 @@ Raw CSV (144 MB)
 │               │   │                                │
 │  1h window    │   │  • Hourly alert volume         │
 │  → score      │   │  • Live fraud rate             │
-│  → alert      │   │  • Top flagged categories      │
+│  → alert      │   │  • Alerts by dataset hour      │
 └──────┬────────┘   │  • High-risk transactions table│
        │            └──────────────────────────────┘
        ▼
@@ -511,22 +511,12 @@ The dashboard is fully provisioned from `grafana/provisioning/` — no manual se
 | **Dataset Fraud Rate** | Stat | Mean hourly fraud rate from `hourly_transaction_summary` |
 | **Hourly Alert Volume** | Time series | Total alerts and confirmed fraud over time (`flagged_at` axis) |
 | **Alert Volume by Dataset Hour** | Time series | Per-hour alert and confirmed fraud counts (hours 0–47) |
-| **Top Flagged Categories** | Pie chart | Alert distribution across six merchant categories |
 | **Recent High-Risk Transactions** | Table | Sortable, colour-coded by combined_score; shows all score components |
 | **Live Fraud Rate by Dataset Hour** | Dual-axis line | Total transaction volume (left axis) vs fraud rate % (right axis) |
 
-#### Merchant categories
+#### No merchant categories
 
-Because the dataset is anonymised (no actual merchant names), transactions are bucketed into six categories based on their normalised `Amount` value:
-
-| Amount (z-score) | Category |
-|---|---|
-| < −1.0 | Grocery & Food |
-| −1.0 to 0.0 | Retail & Shopping |
-| 0.0 to 0.5 | Entertainment |
-| 0.5 to 1.5 | Travel & Transport |
-| 1.5 to 2.5 | Electronics |
-| > 2.5 | Luxury & High-Value |
+The dataset is anonymised: apart from `Time` and `Amount`, every feature is a PCA component, and there is no merchant information at all. An earlier version bucketed the `Amount` z-score into made-up categories ("Electronics", "Luxury & High-Value", …) and charted them as if they were real. That panel has been removed rather than presenting synthetic labels as data.
 
 ---
 
@@ -589,7 +579,7 @@ Transactions are sorted by `Time` and split into three consecutive windows. Noth
 
 ### Views
 
-**`fraud_alerts_enriched`** — Adds `merchant_category` (derived from Amount) and `dataset_hour` to every `fraud_alerts` row. Used by the Top Flagged Categories and Alert Volume by Hour panels.
+**`fraud_alerts_enriched`** — Adds `dataset_hour` to every `fraud_alerts` row. Used by the Alert Volume by Dataset Hour panel.
 
 **`hourly_transaction_summary`** — Aggregates `transactions` by one-hour buckets: total count, confirmed fraud count, and fraud rate percentage. Used by the Live Fraud Rate panel.
 

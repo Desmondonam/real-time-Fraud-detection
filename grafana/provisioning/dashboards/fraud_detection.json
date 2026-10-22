@@ -2,7 +2,7 @@
   "__inputs": [],
   "__requires": [],
   "annotations": { "list": [] },
-  "description": "Real-time fraud detection monitoring — alert volume, fraud rate, and top flagged categories",
+  "description": "Real-time fraud detection monitoring — alert volume, fraud rate",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -290,7 +290,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 13 },
       "id": 7,
       "options": {
         "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -303,37 +303,6 @@
           "datasource": { "type": "postgres", "uid": "fraud_postgres" },
           "rawSql": "SELECT (NOW()::date + (dataset_hour || ' hours')::interval) AS time, COUNT(*) AS \"Alerts\", SUM(CASE WHEN is_confirmed_fraud THEN 1 ELSE 0 END) AS \"Confirmed\" FROM fraud_alerts_enriched GROUP BY dataset_hour ORDER BY dataset_hour",
           "format": "time_series",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "fraud_postgres" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false }
-          },
-          "mappings": [],
-          "unit": "none"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 13 },
-      "id": 8,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"] },
-        "pieType": "pie",
-        "tooltip": { "mode": "single", "sort": "none" }
-      },
-      "title": "Top Flagged Categories",
-      "type": "piechart",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "fraud_postgres" },
-          "rawSql": "SELECT merchant_category AS \"Category\", COUNT(*) AS \"Alerts\" FROM fraud_alerts_enriched GROUP BY merchant_category ORDER BY \"Alerts\" DESC",
-          "format": "table",
           "refId": "A"
         }
       ]
@@ -394,7 +363,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "fraud_postgres" },
-          "rawSql": "SELECT flagged_at, merchant_category, ROUND(\"Amount\"::numeric, 4) AS \"Amount (z-score)\", ROUND(rule_score::numeric, 3) AS rule_score, ROUND(if_score::numeric, 3) AS if_score, ROUND(combined_score::numeric, 3) AS combined_score, is_confirmed_fraud FROM fraud_alerts_enriched WHERE $__timeFilter(flagged_at) ORDER BY combined_score DESC LIMIT 100",
+          "rawSql": "SELECT flagged_at, ROUND(\"Amount\"::numeric, 4) AS \"Amount (z-score)\", ROUND(rule_score::numeric, 3) AS rule_score, ROUND(if_score::numeric, 3) AS if_score, ROUND(combined_score::numeric, 3) AS combined_score, is_confirmed_fraud FROM fraud_alerts_enriched WHERE $__timeFilter(flagged_at) ORDER BY combined_score DESC LIMIT 100",
           "format": "table",
           "refId": "A"
         }

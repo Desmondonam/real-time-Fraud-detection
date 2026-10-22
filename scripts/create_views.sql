@@ -3,14 +3,6 @@
 CREATE OR REPLACE VIEW fraud_alerts_enriched AS
 SELECT
   fa.*,
-  CASE
-    WHEN fa."Amount" < -1.0 THEN 'Grocery & Food'
-    WHEN fa."Amount" < 0.0  THEN 'Retail & Shopping'
-    WHEN fa."Amount" < 0.5  THEN 'Entertainment'
-    WHEN fa."Amount" < 1.5  THEN 'Travel & Transport'
-    WHEN fa."Amount" < 2.5  THEN 'Electronics'
-    ELSE                         'Luxury & High-Value'
-  END AS merchant_category,
   FLOOR(fa.batch_start_sec / 3600)::int AS dataset_hour
 FROM fraud_alerts fa;
 
