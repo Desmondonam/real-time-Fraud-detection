@@ -1,5 +1,7 @@
 # Real-Time Fraud Detection System
 
+[![CI](https://github.com/Desmondonam/real-time-Fraud-detection/actions/workflows/ci.yml/badge.svg)](https://github.com/Desmondonam/real-time-Fraud-detection/actions/workflows/ci.yml)
+
 An end-to-end, real-time fraud detection pipeline. A Kafka producer replays credit card transactions as a live stream, a consumer scores every event with a hybrid rule engine + Isolation Forest model and writes results to PostgreSQL, Airflow retrains and promotes the model on a schedule, and Grafana shows the live picture. Everything starts with a single `docker compose up`.
 
 ---
@@ -235,7 +237,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite runs in about 15 seconds and needs no Postgres, Kafka or dataset. It builds a small synthetic dataset shaped like `creditcard.csv`.
+The suite runs in about 15 seconds and needs no Postgres, Kafka or dataset. GitHub Actions (`.github/workflows/ci.yml`) runs it on every push and pull request. It also validates `docker-compose.yml`, builds the app and Airflow images, and checks that the DAG imports cleanly inside the Airflow image. It builds a small synthetic dataset shaped like `creditcard.csv`.
 
 | File | Covers |
 |---|---|
