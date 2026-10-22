@@ -13,6 +13,7 @@ An end-to-end, real-time fraud detection pipeline. A Kafka producer replays cred
 - [Prerequisites](#prerequisites)
 - [Quick Start (Docker Compose)](#quick-start-docker-compose)
 - [Running Scripts Locally](#running-scripts-locally)
+- [Tests](#tests)
 - [How the System Works](#how-the-system-works)
   - [Stage 1 — Data Ingestion](#stage-1--data-ingestion)
   - [Stage 2 — Detection Logic](#stage-2--detection-logic)
@@ -224,6 +225,23 @@ python -m src.streaming.producer --speedup 600          # replay at 600×
 ```
 
 The model bundle (IF model, learned rules, tuned threshold, split cut-offs and metrics) is saved to `models/fraud_scorer.pkl`, with the metrics also written to `models/metrics.json`. Inside Docker it lives in the `models` volume instead, so containers and host never mix scikit-learn versions.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite runs in about 15 seconds and needs no Postgres, Kafka or dataset. It builds a small synthetic dataset shaped like `creditcard.csv`.
+
+| File | Covers |
+|---|---|
+| `tests/test_rule_engine.py` | Amount σ-rules, `<` / `>` thresholds at their boundaries, time-of-day multipliers, normalisation to exactly 1.0, learned features/directions/thresholds, serialisation |
+| `tests/test_scorer.py` | Weighted combination, threshold flagging, save/load round trip, `fit`/`tune`/`test` labelling, the time split, and a **leakage test**: flipping every label in the test window must not change the learned rules, threshold or IF scores |
+| `tests/test_streaming.py` | Producer ordering, `txn_id` assignment, label-free payloads; consumer parsing of malformed messages, per-event row building, latency, and parity with batch scoring |
 
 ---
 
